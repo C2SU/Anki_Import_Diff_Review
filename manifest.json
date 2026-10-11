@@ -1,0 +1,6 @@
+{
+    "name": "Anki Import Diff Review",
+    "package": "anki_import_diff",
+    "human_version": "1.0.0",
+    "min_point_version": 231000
+}

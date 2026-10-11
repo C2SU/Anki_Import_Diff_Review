@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.agents/
+meta.json
+*.log
+*.db
+pytest_out.txt
+user_files/
+.vscode/
+.idea/
