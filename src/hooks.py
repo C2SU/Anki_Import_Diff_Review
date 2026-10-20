@@ -112,39 +112,48 @@ def is_visual_diff_enabled() -> bool:
     return _visual_diff_enabled
 
 
+_qt_msg_handler_installed = False
+_prev_qt_msg_handler = None
+_js_console_filter_installed = False
+
+
 def install_qt_message_handler() -> None:
     """
     Installs a custom Qt message handler to suppress wildcard disconnect warnings
-    from QPushButton (and other widgets) during destruction.
+    from QPushButton (and other widgets) during destruction, while delegating
+    all other messages to Anki's original Qt message handler.
     """
+    global _qt_msg_handler_installed, _prev_qt_msg_handler
+    if _qt_msg_handler_installed:
+        return
     try:
         try:
             from PyQt6 import QtCore
         except ImportError:
             from PySide6 import QtCore
 
-        import sys
-
         def qt_message_handler(mode, context, message: str) -> None:
             # Filter out wildcard disconnect warnings
-            if "wildcard call disconnects from destroyed signal" in message:
+            if message and "wildcard call disconnects from destroyed signal" in message:
                 return
 
-            # Print other messages to stdout (except fatal) to prevent Anki from showing modal warnings
-            # Use print() to handle platform-specific encoding safely
-            if mode == QtCore.QtMsgType.QtFatalMsg:
-                print(f"Qt fatal: {message}", file=sys.stderr)
-                sys.exit(1)
-            elif mode == QtCore.QtMsgType.QtCriticalMsg:
+            if _prev_qt_msg_handler is not None:
+                try:
+                    _prev_qt_msg_handler(mode, context, message)
+                    return
+                except Exception:
+                    pass
+
+            # Fallback logging if no previous handler was registered
+            if mode == QtCore.QtMsgType.QtCriticalMsg:
                 print(f"Qt critical: {message}")
             elif mode == QtCore.QtMsgType.QtWarningMsg:
                 print(f"Qt warning: {message}")
             elif mode == QtCore.QtMsgType.QtInfoMsg:
                 print(f"Qt info: {message}")
-            else:
-                print(f"Qt debug: {message}")
 
-        QtCore.qInstallMessageHandler(qt_message_handler)
+        _prev_qt_msg_handler = QtCore.qInstallMessageHandler(qt_message_handler)
+        _qt_msg_handler_installed = True
         print("[anki-diff] Custom Qt message handler installed to suppress wildcard disconnect warnings")
     except Exception as e:
         print("[anki-diff] Failed to install custom Qt message handler:", e)
@@ -152,19 +161,27 @@ def install_qt_message_handler() -> None:
 
 def install_js_console_filter() -> None:
     """
-    Monkeypatches AnkiWebPage.javaScriptConsoleMessage to suppress noisy
+    Monkeypatches AnkiWebPage.javaScriptConsoleMessage idempotently to suppress noisy
     MathJax [tex]/mathtools and [tex]/noerrors warnings in the console.
     """
+    global _js_console_filter_installed
+    if _js_console_filter_installed:
+        return
     try:
         import aqt.webview
         original_console_msg = aqt.webview.AnkiWebPage.javaScriptConsoleMessage
+        if getattr(original_console_msg, "_anki_diff_wrapped", False):
+            _js_console_filter_installed = True
+            return
 
         def patched_console_msg(self, level, msg: str | None, line: int, srcID: str | None) -> None:
             if msg and ("[tex]/" in msg or "No version information available" in msg):
                 return
             original_console_msg(self, level, msg, line, srcID)
 
+        patched_console_msg._anki_diff_wrapped = True
         aqt.webview.AnkiWebPage.javaScriptConsoleMessage = patched_console_msg
+        _js_console_filter_installed = True
         print("[anki-diff] Custom JS console message filter installed to suppress MathJax version warnings")
     except Exception as e:
         print("[anki-diff] Failed to install custom JS console filter:", e)
@@ -219,13 +236,39 @@ def setup_hooks() -> None:
     # entièrement construit ou aqt.mw.col peut ne pas être disponible.
     try:
         from aqt import gui_hooks
+        gui_hooks.profile_did_open.append(_on_profile_did_open)
         gui_hooks.profile_did_open.append(_wrap_flask_handlers_once)
-        gui_hooks.profile_will_close.append(flush_pending_history_snapshots)
+        gui_hooks.profile_will_close.append(_on_profile_will_close)
         print("[anki-diff] setup_hooks: profile_did_open and profile_will_close hooks registered")
     except Exception as e:
         # Fallback : essayer directement (si le profil est déjà ouvert, e.g. en test)
         print(f"[anki-diff] setup_hooks: hooks registration error ({e}), wrapping immediately")
+        _on_profile_did_open()
         _wrap_flask_handlers_once()
+
+
+def _on_profile_did_open() -> None:
+    """Réinitialise NoteHistoryDB pour pointer sur le profil actif."""
+    try:
+        from .history import NoteHistoryDB
+        NoteHistoryDB.reset_instance()
+        print("[anki-diff] NoteHistoryDB instance reset on profile open")
+    except Exception as e:
+        print("[anki-diff] Failed to reset NoteHistoryDB instance:", e)
+
+
+def _on_profile_will_close() -> None:
+    """Vide les snapshots en attente et libère immédiatement tous les verrous SQLite."""
+    try:
+        flush_pending_history_snapshots()
+    except Exception as e:
+        print("[anki-diff] Error flushing history snapshots on profile close:", e)
+    try:
+        from .history import NoteHistoryDB
+        NoteHistoryDB.reset_instance()
+        print("[anki-diff] NoteHistoryDB closed cleanly on profile close")
+    except Exception as e:
+        print("[anki-diff] Error closing NoteHistoryDB on profile close:", e)
 
 
 def _wrap_flask_handlers_once() -> None:
@@ -237,13 +280,6 @@ def _wrap_flask_handlers_once() -> None:
     if _handlers_wrapped:
         return
     _handlers_wrapped = True
-
-    try:
-        from .history import NoteHistoryDB
-        NoteHistoryDB.reset_instance()
-        print("[anki-diff] NoteHistoryDB instance reset on profile open")
-    except Exception as e:
-        print("[anki-diff] Failed to reset NoteHistoryDB instance:", e)
 
     try:
         from aqt.mediasrv import post_handlers
@@ -643,6 +679,23 @@ def _force_update_mode_qt(dialog: Any) -> None:
     return
 
 
+def _safely_clear_editor_if_note_deleted(deleted_nids: List[int]) -> None:
+    """Désassigne la note de l'éditeur Anki si la note en cours d'édition fait partie des notes supprimées."""
+    deleted_set = set(deleted_nids)
+    if not deleted_set:
+        return
+    try:
+        mw = getattr(aqt, "mw", None)
+        if mw:
+            browser = getattr(mw, "browser", None)
+            if browser and hasattr(browser, "editor"):
+                ed_note = getattr(browser.editor, "note", None)
+                if ed_note and getattr(ed_note, "id", None) in deleted_set:
+                    browser.editor.set_note(None)
+    except Exception:
+        pass
+
+
 def commit_changes(accepted_diffs: List[NoteDiff]) -> None:
     flush_pending_history_snapshots()
     mw = aqt.mw
@@ -678,10 +731,18 @@ def commit_changes(accepted_diffs: List[NoteDiff]) -> None:
     deleted_count = 0
     errors = []
 
+    undo_pos = None
+    if hasattr(col, "add_custom_undo_entry"):
+        try:
+            undo_pos = col.add_custom_undo_entry("Import Diff")
+        except Exception:
+            undo_pos = None
+
     for diff in accepted_diffs:
         if diff.excluded:
             if diff.action == "INSERT" and diff.staged_note_id:
                 try:
+                    _safely_clear_editor_if_note_deleted([diff.staged_note_id])
                     col.remove_notes([diff.staged_note_id])
                 except Exception:
                     pass
@@ -720,6 +781,8 @@ def commit_changes(accepted_diffs: List[NoteDiff]) -> None:
                     # On met simplement à jour ses champs avec les merged_fields.
                     try:
                         note = col.get_note(diff.staged_note_id)
+                        if getattr(diff, "guid", ""):
+                            note.guid = diff.guid
                         model = col.models.get(note.mid)
                         if model:
                             field_indices = {f["name"]: idx for idx, f in enumerate(model.get("flds", []))}
@@ -770,6 +833,8 @@ def commit_changes(accepted_diffs: List[NoteDiff]) -> None:
                     note = col.new_note(model)
                     if diff.note_id and diff.note_id > 0:
                         note.id = diff.note_id
+                    if getattr(diff, "guid", ""):
+                        note.guid = diff.guid
                     for idx, val in enumerate(fields):
                         if idx < len(note.fields):
                             note.fields[idx] = val
@@ -792,6 +857,19 @@ def commit_changes(accepted_diffs: List[NoteDiff]) -> None:
             errors.append(f"Note {diff.note_id}: {e}")
 
     print(f"[anki-diff] commit_changes done: {updated_count} updated, {inserted_count} inserted, {deleted_count} deleted, {len(errors)} errors")
+
+    # ── Actualisation des liens créés avec un NID temporaire et migration NID ──
+    try:
+        from .temp_link_interceptor import TempLinkInterceptor
+        TempLinkInterceptor.instance().on_diff_session_closed(col=col, committed=True)
+    except Exception as e_interceptor:
+        print(f"[anki-diff] commit_changes temp_link_interceptor error: {e_interceptor}")
+
+    if undo_pos is not None and hasattr(col, "merge_undo_entries"):
+        try:
+            col.merge_undo_entries(undo_pos)
+        except Exception:
+            pass
 
     # ── Snapshot APRÈS commit (état mergé) ───────────────────────────────
     try:
@@ -1009,6 +1087,16 @@ def patch_collection_updates() -> None:
 
         if getattr(_in_update, "active", False):
             return Collection._original_update_note(self, note, *args, **kwargs)
+
+        # Garde-fou d'intégrité DB : si la note n'existe plus en base (ex: staged note annulée),
+        # ne pas appeler le backend Rust qui lèverait l'erreur 'No such note'
+        try:
+            if note and hasattr(note, "id") and note.id:
+                if not self.db.first("SELECT 1 FROM notes WHERE id = ?", note.id):
+                    return
+        except Exception:
+            pass
+
         _in_update.active = True
         try:
             _save_history_before_bulk(self, [note])
@@ -1028,6 +1116,21 @@ def patch_collection_updates() -> None:
             ):
                 return Collection._original_update_notes(self, notes_list_check, *args, **kwargs)
             notes = notes_list_check  # réutiliser la liste déjà consommée
+        except Exception:
+            pass
+
+        # Garde-fou d'intégrité DB : filtrer les notes qui n'existent plus en base
+        try:
+            valid_notes = []
+            for n in notes:
+                if hasattr(n, "id") and n.id:
+                    if self.db.first("SELECT 1 FROM notes WHERE id = ?", n.id):
+                        valid_notes.append(n)
+                else:
+                    valid_notes.append(n)
+            notes = valid_notes
+            if not notes:
+                return
         except Exception:
             pass
 
@@ -1143,7 +1246,7 @@ def _save_history_before_bulk(col, notes) -> None:
         pass
 
     source = "ankicollab" if is_collab else "manual"
-    comment = "Mise à jour via AnkiCollab" if is_collab else "Sauvegarde automatique (modification)"
+    comment = "Mise à jour via AnkiCollab" if is_collab else "Sauvegarde automatique (édition)"
 
     # Garde-fou révision : en session de révision active, les cartes sont révisées mais les
     # champs des notes ne sont pas édités par l'utilisateur. Éviter d'interroger la DB inutilement.
@@ -1228,6 +1331,17 @@ def _save_history_before_bulk(col, notes) -> None:
             continue
 
         if use_debounce:
+            # ── Garantir la baseline initiale avant d'enregistrer la suite ──
+            try:
+                db.ensure_baseline_snapshot(
+                    note_id=note_id,
+                    fields=old_fields,
+                    tags=old_tags,
+                    mod_time=getattr(note, "mod", None),
+                )
+            except Exception:
+                pass
+
             # ── Debounce interactif ─────────────────────────────────────────
             captured_fields = dict(old_fields)
             captured_tags = list(old_tags)

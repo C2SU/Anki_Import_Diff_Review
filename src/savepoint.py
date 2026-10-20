@@ -1,18 +1,44 @@
 import sqlite3
-try:
-    sqlite3.register_adapter(str, lambda s: s.encode('utf-8', 'surrogatepass'))
-except Exception:
-    pass
-
-try:
-    sqlite3.register_adapter(str, lambda s: s.encode('utf-8', 'surrogatepass') if any(0xd800 <= ord(c) <= 0xdfff for c in s) else s)
-except Exception:
-    pass
-
+import re
 from dataclasses import dataclass, field
-from typing import List, Dict, Callable, Any
+from typing import List, Dict, Callable, Any, Optional
 import aqt
 import threading
+
+def _sanitize_savepoint_name(name: str) -> str:
+    if not isinstance(name, str) or not re.match(r'^[a-zA-Z0-9_]+$', name):
+        raise ValueError(f"Invalid savepoint name: {name}")
+    return name
+
+class SavepointManager:
+    """Manages SQLite savepoints with local name sanitization (validating ^[a-zA-Z0-9_]+$)."""
+    def __init__(self, db: Any, name: str = "import_diff"):
+        self.db = db
+        self.name = _sanitize_savepoint_name(name)
+
+    def create(self) -> None:
+        self.db.execute(f"SAVEPOINT {self.name}")
+
+    def rollback(self) -> None:
+        try:
+            self.db.execute(f"ROLLBACK TO SAVEPOINT {self.name}")
+        except Exception:
+            pass
+
+    def release(self) -> None:
+        try:
+            self.db.execute(f"RELEASE SAVEPOINT {self.name}")
+        except Exception:
+            pass
+
+    def __enter__(self):
+        self.create()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.rollback()
+        self.release()
 
 _import_lock = threading.Lock()
 
@@ -37,6 +63,7 @@ class NoteDiff:
     model_id: int = 0          # model ID (mid) — lookup fiable sans dépendre du nom
     deck_id: int = 0           # deck cible pour les notes INSERT (capturé pendant le savepoint)
     staged_note_id: int = 0    # ID réel après pré-insertion temporaire dans le browser
+    guid: str = ""             # GUID Anki d'origine (préservé pour AnkiCollab et imports ultérieurs)
 
     def __post_init__(self):
         if not self.merged_fields:
@@ -146,7 +173,8 @@ def capture_import_changes(import_fn: Callable[..., Any], *args: Any, **kwargs: 
                     model_id INTEGER,
                     tags TEXT,
                     old_tags TEXT,
-                    new_tags TEXT
+                    new_tags TEXT,
+                    guid TEXT
                 )
             """)
             # Clear any leftover data from previous runs if temp table persisted
@@ -155,44 +183,45 @@ def capture_import_changes(import_fn: Callable[..., Any], *args: Any, **kwargs: 
             # Create triggers
             db.execute(f"""
                 CREATE TEMP TRIGGER IF NOT EXISTS {trig_ins} AFTER INSERT ON notes BEGIN
-                    INSERT INTO {tbl} (note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags)
-                    VALUES (new.id, 'INSERT', NULL, new.flds, new.mid, new.tags, NULL, new.tags);
+                    INSERT INTO {tbl} (note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags, guid)
+                    VALUES (new.id, 'INSERT', NULL, new.flds, new.mid, new.tags, NULL, new.tags, new.guid);
                 END;
             """)
             db.execute(f"""
                 CREATE TEMP TRIGGER IF NOT EXISTS {trig_upd} AFTER UPDATE ON notes BEGIN
-                    INSERT INTO {tbl} (note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags)
-                    VALUES (new.id, 'UPDATE', old.flds, new.flds, new.mid, new.tags, old.tags, new.tags);
+                    INSERT INTO {tbl} (note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags, guid)
+                    VALUES (new.id, 'UPDATE', old.flds, new.flds, new.mid, new.tags, old.tags, new.tags, new.guid);
                 END;
             """)
             db.execute(f"""
                 CREATE TEMP TRIGGER IF NOT EXISTS {trig_del} AFTER DELETE ON notes BEGIN
-                    INSERT INTO {tbl} (note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags)
-                    VALUES (old.id, 'DELETE', old.flds, NULL, old.mid, old.tags, old.tags, NULL);
+                    INSERT INTO {tbl} (note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags, guid)
+                    VALUES (old.id, 'DELETE', old.flds, NULL, old.mid, old.tags, old.tags, NULL, old.guid);
                 END;
             """)
             
             # Create savepoint after temp table and triggers are created
-            db.execute("SAVEPOINT import_diff")
+            sp = SavepointManager(db, "import_diff")
+            sp.create()
             
             try:
                 import_fn(*args, **kwargs)
                 
                 # Query results
-                rows = db.all(f"SELECT note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags FROM temp.{tbl}")
+                rows = db.all(f"SELECT note_id, action, old_flds, new_flds, model_id, tags, old_tags, new_tags, guid FROM temp.{tbl}")
                 
                 # Build NoteDiff objects
                 # db.all() returns plain tuples — use positional indices
-                # (SELECT order: note_id=0, action=1, old_flds=2, new_flds=3, model_id=4, tags=5, old_tags=6, new_tags=7)
+                # (SELECT order: note_id=0, action=1, old_flds=2, new_flds=3, model_id=4, tags=5, old_tags=6, new_tags=7, guid=8)
                 def _row_get(row, idx, name):
                     """Access a row by index (plain tuple) or name (sqlite3.Row)."""
                     try:
                         return row[idx]
-                    except (KeyError, IndexError):
+                    except (KeyError, IndexError, TypeError):
                         pass
                     try:
                         return row[name]
-                    except (KeyError, IndexError):
+                    except (KeyError, IndexError, TypeError):
                         return None
 
                 # Group by note_id to preserve the initial old values and latest new values
@@ -215,6 +244,7 @@ def capture_import_changes(import_fn: Callable[..., Any], *args: Any, **kwargs: 
                     tags_str = _row_get(last_row, 5, "tags") or ""
                     old_tags_str = _row_get(first_row, 6, "old_tags")
                     new_tags_str = _row_get(last_row, 7, "new_tags")
+                    guid_str = _row_get(last_row, 8, "guid") or _row_get(first_row, 8, "guid") or ""
                     
                     if isinstance(old_flds_str, bytes):
                         old_flds_str = old_flds_str.decode('utf-8', 'surrogatepass')
@@ -226,6 +256,8 @@ def capture_import_changes(import_fn: Callable[..., Any], *args: Any, **kwargs: 
                         old_tags_str = old_tags_str.decode('utf-8', 'surrogatepass')
                     if isinstance(new_tags_str, bytes):
                         new_tags_str = new_tags_str.decode('utf-8', 'surrogatepass')
+                    if isinstance(guid_str, bytes):
+                        guid_str = guid_str.decode('utf-8', 'surrogatepass')
                     
                     # Split tags
                     if action == "INSERT":
@@ -278,7 +310,9 @@ def capture_import_changes(import_fn: Callable[..., Any], *args: Any, **kwargs: 
                         try:
                             deck_rows = db.all(f"SELECT did FROM cards WHERE nid = {nid} LIMIT 1")
                             if deck_rows:
-                                diff_deck_id = int(deck_rows[0][0])
+                                did_val = _row_get(deck_rows[0], 0, "did")
+                                if did_val is not None:
+                                    diff_deck_id = int(did_val)
                         except Exception:
                             pass
 
@@ -294,20 +328,15 @@ def capture_import_changes(import_fn: Callable[..., Any], *args: Any, **kwargs: 
                         updated_tags=upd_tags,
                         model_id=mid or 0,
                         deck_id=diff_deck_id,
+                        guid=guid_str or "",
                     ))
                     
                 return diffs
                 
             finally:
                 # Rollback and release savepoint first
-                try:
-                    db.execute("ROLLBACK TO SAVEPOINT import_diff")
-                except Exception:
-                    pass
-                try:
-                    db.execute("RELEASE SAVEPOINT import_diff")
-                except Exception:
-                    pass
+                sp.rollback()
+                sp.release()
                 
                 # Cleanup triggers and temp table
                 try:

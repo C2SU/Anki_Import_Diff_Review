@@ -237,6 +237,86 @@ class TestNoteHistoryDB:
         history = tmp_db.get_history(52)
         assert len(history) == 1
 
+    def test_ensure_baseline_snapshot(self, tmp_db):
+        # 1. Baseline initial created
+        vid = tmp_db.ensure_baseline_snapshot(60, {"F": "original"}, tags=["t1"])
+        assert vid is not None
+        h = tmp_db.get_history(60)
+        assert len(h) == 1
+        assert h[0].source == "baseline"
+        assert h[0].fields["F"] == "original"
+
+        # 2. Calling ensure_baseline_snapshot again with same data does not duplicate
+        vid2 = tmp_db.ensure_baseline_snapshot(60, {"F": "original"}, tags=["t1"])
+        assert vid2 is None
+        assert len(tmp_db.get_history(60)) == 1
+
+        # 3. Store a manual edit: baseline is NOT overwritten
+        tmp_db.store_snapshot(60, {"F": "edited 1"}, source="manual")
+        h2 = tmp_db.get_history(60)
+        assert len(h2) == 2
+        # Most recent is manual edit
+        assert h2[0].source == "manual" and h2[0].fields["F"] == "edited 1"
+        # Older is baseline, intact
+        assert h2[1].source == "baseline" and h2[1].fields["F"] == "original"
+
+    def test_consolidate_intermediate_versions(self, tmp_db):
+        from datetime import datetime, timedelta
+        conn = tmp_db._conn()
+        t0 = datetime(2026, 10, 5, 14, 0, 0)
+        for i in range(6):
+            ts = (t0 + timedelta(seconds=i * 2)).isoformat()
+            conn.execute(
+                "INSERT INTO note_versions VALUES (?, ?, ?, 'manual', 'burst', ?)",
+                (f"v_burst_{i}", 70, ts, f'{{"F": "val_{i}"}}'),
+            )
+        conn.commit()
+        assert len(tmp_db.get_history(70)) == 6
+        deleted = tmp_db.consolidate_intermediate_versions(70)
+        assert deleted == 4
+        h = tmp_db.get_history(70)
+        assert len(h) == 2
+        # Kept the first (initial before typing) and last (final result)
+        assert h[0].fields["F"] == "val_5"
+        assert h[1].fields["F"] == "val_0"
+
+    def test_get_history_with_deltas(self, tmp_db):
+        tmp_db.store_snapshot(80, {"Recto": "Hello", "Verso": "World"}, tags=["tag1"])
+        tmp_db.store_snapshot(80, {"Recto": "Hello!", "Verso": "World"}, tags=["tag1", "tag2"])
+        
+        deltas = tmp_db.get_history_with_deltas(80)
+        assert len(deltas) == 2
+        
+        # Newest version is deltas[0]
+        v_new = deltas[0]
+        assert v_new.version_number == 2
+        assert "Recto" in v_new.changed_fields
+        assert v_new.changed_fields["Recto"].old_value == "Hello"
+        assert v_new.changed_fields["Recto"].new_value == "Hello!"
+        # Verso was not changed, so it should NOT be in changed_fields
+        assert "Verso" not in v_new.changed_fields
+        assert v_new.tags_changed is True
+        assert v_new.new_tags == ["tag1", "tag2"]
+
+    def test_close_releases_file_lock(self, tmp_path):
+        db_path = str(tmp_path / "lock_test.db")
+        db = NoteHistoryDB(db_path=db_path)
+        db.store_snapshot(99, {"F": "data"})
+        db.close()
+        # The file should be removable immediately on Windows without PermissionError
+        os.remove(db_path)
+        assert not os.path.exists(db_path)
+
+    def test_reset_instance_closes_connections(self, tmp_path):
+        db_path = str(tmp_path / "reset_test.db")
+        db = NoteHistoryDB(db_path=db_path)
+        NoteHistoryDB._instance = db
+        db.store_snapshot(100, {"F": "data"})
+        NoteHistoryDB.reset_instance()
+        assert NoteHistoryDB._instance is None
+        os.remove(db_path)
+        assert not os.path.exists(db_path)
+
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +397,84 @@ class TestProtectedFieldsDB:
         assert not protection_db.is_protected(300, "Verso")
         assert protection_db.is_protected(300, "Recto")
         assert protection_db.is_protected(300, "Extra")
+
+
+def test_history_panel_ui(qtbot, tmp_db):
+    """Test le panneau d'historique personnel et le mode de comparaison des champs modifies."""
+    from PyQt6 import QtWidgets
+    from anki_import_diff.src.ankicollab_panel import (
+        AnkiCollabHistoryPanel,
+        FieldComparisonCard,
+        TagsComparisonCard,
+        UnchangedFieldsCollapsible,
+    )
+
+    NoteHistoryDB._instance = tmp_db
+
+    # Inserer deux versions
+    tmp_db.store_snapshot(
+        note_id=500,
+        fields={"Recto": "Ancien Recto", "Verso": "Meme Verso", "Extra": "Ancien Extra"},
+        source="baseline",
+        comment="Etat initial",
+        tags=["tagA"],
+    )
+    tmp_db.store_snapshot(
+        note_id=500,
+        fields={"Recto": "Nouveau Recto", "Verso": "Meme Verso", "Extra": ""},
+        source="manual",
+        comment="Sauvegarde automatique (edition)",
+        tags=["tagA", "tagB"],
+    )
+
+    current_fields = {"Recto": "Nouveau Recto", "Verso": "Meme Verso", "Extra": "", "__tags__": "tagA tagB"}
+    field_names = ["Recto", "Verso", "Extra"]
+
+    panel = AnkiCollabHistoryPanel(
+        note_id=500,
+        field_names=field_names,
+        current_fields=current_fields,
+    )
+    qtbot.addWidget(panel)
+
+    # Verifier que 2 versions sont dans la liste
+    assert panel._list.count() == 2
+
+    # Verifier que le premier element (v2) est selectionne
+    assert panel._selected_delta is not None
+    assert panel._selected_delta.version_number == 2
+
+    # Verifier que seuls Recto et Extra (les champs modifies) ont des cartes, pas Verso !
+    cards = panel._cards_container.findChildren(FieldComparisonCard)
+    card_names = [c.findChild(QtWidgets.QLabel).text() for c in cards]
+    assert any("Recto" in name for name in card_names)
+    assert any("Extra" in name for name in card_names)
+    assert not any("Verso" in name for name in card_names)
+
+    # Verifier la carte de tags
+    tags_cards = panel._cards_container.findChildren(TagsComparisonCard)
+    assert len(tags_cards) == 1
+
+    # Verifier le tiroir des champs inchanges (Verso doit etre dans la liste des inchanges)
+    unchanged_coll = panel._cards_container.findChildren(UnchangedFieldsCollapsible)
+    assert len(unchanged_coll) == 1
+    assert "Verso" in unchanged_coll[0]._unchanged
+
+    # Tester la restauration d'un champ individuel via signal
+    received = []
+    panel.version_retrieved.connect(lambda f: received.append(f))
+
+    # Appeler directement la restauration de l'ancien Recto
+    panel._on_restore_field("Recto", "Ancien Recto")
+    assert len(received) == 1
+    assert received[0] == {"Recto": "Ancien Recto"}
+
+    # Tester la restauration de toute la version v1
+    panel._list.setCurrentRow(1)  # v1
+    panel._on_restore_full_version()
+    assert len(received) == 2
+    assert received[1]["Recto"] == "Ancien Recto"
+    assert received[1]["Extra"] == "Ancien Extra"
 
 
 def test_api_client(qtbot):

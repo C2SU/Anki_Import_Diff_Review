@@ -215,6 +215,9 @@ class _AutoResizingTextBrowser(QtWidgets.QTextBrowser):
             self.selectAll()
             event.accept()
             return
+        elif event.key() in (_Qt.Key.Key_Up, _Qt.Key.Key_Down) and not event.modifiers():
+            event.ignore()
+            return
         super().keyPressEvent(event)
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent):
@@ -1183,6 +1186,16 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
 
         self._refresh_display()
 
+    def _set_browser_html_preserve_scroll(self, html_content: str):
+        if getattr(self, "_last_rendered_html", None) == html_content:
+            return
+        self._last_rendered_html = html_content
+        vsb = self._old_val_browser.verticalScrollBar()
+        scroll_pos = vsb.value() if vsb else 0
+        self._old_val_browser.setHtml(html_content)
+        if vsb and scroll_pos > 0:
+            vsb.setValue(scroll_pos)
+
     def _refresh_display(self):
         c = self._palette_colors()
         is_unchanged = (self.old_orig == self.prop_orig)
@@ -1199,7 +1212,7 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
             self._orig_lbl.setText("Version protégée")
             self._btn_reset_diff.hide()
             html_content = _unfold_and_style_html(self.old_orig, self._model_css, c, "[Champ protégé]")
-            self._old_val_browser.setHtml(html_content)
+            self._set_browser_html_preserve_scroll(html_content)
             return
 
         if is_unchanged:
@@ -1214,7 +1227,7 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
             self._orig_lbl.setText("Version inchangée")
             self._btn_reset_diff.hide()
             html_content = _unfold_and_style_html(self.old_orig, self._model_css, c, "[Champ vide]")
-            self._old_val_browser.setHtml(html_content)
+            self._set_browser_html_preserve_scroll(html_content)
             return
 
         self._btn_reject_all.show()
@@ -1258,7 +1271,7 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
 
             placeholder = "[Champ vide dans la version pré-maj]"
             html_content = _unfold_and_style_html(disp_val, self._model_css, c, placeholder)
-            self._old_val_browser.setHtml(html_content)
+            self._set_browser_html_preserve_scroll(html_content)
 
         else:
             # L'éditeur contient l'ancien (old_mod)
@@ -1298,7 +1311,7 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
 
             placeholder = "[Champ vide dans la proposition]"
             html_content = _unfold_and_style_html(disp_val, self._model_css, c, placeholder)
-            self._old_val_browser.setHtml(html_content)
+            self._set_browser_html_preserve_scroll(html_content)
 
     def _accept_all(self):
         self.active_target = "PROP"
@@ -1372,10 +1385,14 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
 
     def on_editor_modified(self, new_val: str):
         if self.active_target == "PROP":
+            if self.prop_mod == new_val:
+                return
             self.prop_mod = new_val
             if self.diff:
                 self.diff.prop_mod_fields[self.field_name] = new_val
         else:
+            if self.old_mod == new_val:
+                return
             self.old_mod = new_val
             if self.diff:
                 self.diff.old_mod_fields[self.field_name] = new_val
@@ -1867,7 +1884,7 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
         self._note_hunks: Dict[int, Dict[str, List[DiffHunk]]] = {}
         try:
             from .history import ProtectedFieldsDB
-            pdb = ProtectedFieldsDB.instance()
+            pdb = ProtectedFieldsDB.instance() if hasattr(ProtectedFieldsDB, "instance") else ProtectedFieldsDB()
         except Exception:
             pdb = None
 
@@ -1970,6 +1987,9 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
                 or (has_ctrl and has_shift and key == QtCore.Qt.Key.Key_R)
             )
 
+            is_up = (key == QtCore.Qt.Key.Key_Up and not (has_alt or has_ctrl or has_shift))
+            is_down = (key == QtCore.Qt.Key.Key_Down and not (has_alt or has_ctrl or has_shift))
+
             if is_accept:
                 self._accept_all_global()
                 return True
@@ -1977,6 +1997,21 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
             if is_reject:
                 self._reject_all_global()
                 return True
+
+            if is_up or is_down:
+                app = QtWidgets.QApplication.instance()
+                focus_w = app.focusWidget() if app else None
+                is_text_edit = (
+                    focus_w is not None
+                    and isinstance(focus_w, (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit))
+                    and not getattr(focus_w, "isReadOnly", lambda: False)()
+                )
+                if not is_text_edit:
+                    if is_up:
+                        self._prev_note()
+                    else:
+                        self._next_note()
+                    return True
 
         return super().eventFilter(obj, event)
 
@@ -1997,6 +2032,8 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
             ("Ctrl+Shift+R", self._reject_all_global),
             ("Right", self._next_note),
             ("Left", self._prev_note),
+            ("Down", self._next_note),
+            ("Up", self._prev_note),
             ("Tab", self._focus_next_hunk),
             ("Shift+Tab", self._focus_prev_hunk),
             ("Space", self._toggle_focused_hunk),
@@ -2565,16 +2602,16 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
                         try:
                             btn = fp._btn_accept_all
                             fp._btn_accept_all = None
-                            btn.clicked.disconnect()
-                            sip.delete(btn)
+                            if not sip.isdeleted(btn):
+                                btn.deleteLater()
                         except Exception:
                             pass
                     if hasattr(fp, "_btn_reject_all") and fp._btn_reject_all is not None:
                         try:
                             btn = fp._btn_reject_all
                             fp._btn_reject_all = None
-                            btn.clicked.disconnect()
-                            sip.delete(btn)
+                            if not sip.isdeleted(btn):
+                                btn.deleteLater()
                         except Exception:
                             pass
             for btn_attr in ("_acc_all_btn", "_rej_all_btn", "_btn_sel_all", "_btn_sel_none", "_btn_cancel", "_btn_commit"):
@@ -2582,8 +2619,8 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
                     try:
                         btn = getattr(self, btn_attr)
                         setattr(self, btn_attr, None)
-                        btn.clicked.disconnect()
-                        sip.delete(btn)
+                        if not sip.isdeleted(btn):
+                            btn.deleteLater()
                     except Exception:
                         pass
         except Exception:

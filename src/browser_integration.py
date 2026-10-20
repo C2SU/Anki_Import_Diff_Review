@@ -111,6 +111,13 @@ def set_pending_diffs(diffs: List[NoteDiff], on_commit) -> None:
 
 def clear_pending_diffs() -> None:
     global _pending_diffs, _on_commit_cb, _browser_panel, _field_edit_hook, _staged_to_orig
+    try:
+        from .temp_link_interceptor import TempLinkInterceptor
+        interceptor = TempLinkInterceptor.instance()
+        if interceptor.is_active():
+            interceptor.on_diff_session_closed(committed=_committed)
+    except Exception:
+        pass
     _pending_diffs.clear()
     _on_commit_cb = None
     _staged_to_orig.clear()
@@ -123,11 +130,19 @@ def clear_pending_diffs() -> None:
             pass
         _field_edit_hook = None
 
+    _restore_editor_save()
+
     # Capturer la référence locale PUIS mettre le global à None EN PREMIER
     # pour éviter les appels récursifs (cleanup() rappelle clear_pending_diffs()).
     panel = _browser_panel
     _browser_panel = None
     if panel is not None:
+        try:
+            browser = getattr(panel, "_browser", None)
+            if browser and getattr(browser, "editor", None) and getattr(browser.editor, "web", None):
+                browser.editor.web.eval("window._anki_diff_active = false;")
+        except Exception:
+            pass
         try:
             panel.cleanup()
         except Exception:
@@ -182,6 +197,8 @@ def _stage_insert_notes(diffs: List[NoteDiff]) -> List[int]:
 
             # Créer la note avec les champs mis à jour
             note = col.new_note(model)
+            if getattr(diff, "guid", ""):
+                note.guid = diff.guid
             for idx, fname in enumerate(diff.field_names):
                 val = diff.updated_fields.get(fname, "")
                 if idx < len(note.fields):
@@ -201,6 +218,13 @@ def _stage_insert_notes(diffs: List[NoteDiff]) -> List[int]:
         except Exception as e:
             print(f"[anki-diff] Failed to stage INSERT note {diff.note_id}: {e}")
 
+    if _staged_to_orig:
+        try:
+            from .temp_link_interceptor import start_diff_session
+            start_diff_session(_staged_to_orig)
+        except Exception as e_interceptor:
+            print(f"[anki-diff] Error starting temp_link_interceptor session: {e_interceptor}")
+
     return staged_nids
 
 
@@ -213,6 +237,11 @@ def _unstage_insert_notes(diffs_dict: Dict[int, NoteDiff]) -> None:
         if diff.action == "INSERT" and diff.staged_note_id
     ]
     if staged_ids:
+        try:
+            from .hooks import _safely_clear_editor_if_note_deleted
+            _safely_clear_editor_if_note_deleted(staged_ids)
+        except Exception:
+            pass
         try:
             col.remove_notes(staged_ids)
             print(f"[anki-diff] Removed {len(staged_ids)} staged INSERT note(s) (cancelled)")
@@ -486,59 +515,91 @@ QPushButton:hover {{
 """
 
 
-def _is_inside_field(panel: "DiffBrowserPanel") -> bool:
+def _is_inside_field(panel: Optional["DiffBrowserPanel"], obj: Optional[QtCore.QObject] = None) -> bool:
     """
     Détermine si l'utilisateur est actuellement à l'intérieur d'un champ d'édition de note.
-    Retourne True UNIQUEMENT si le focus et/ou le pointeur de la souris se trouvent
-    dans un champ éditable de l'éditeur Anki ou un widget de saisie de texte.
-    Si la souris pointe sur le panneau de diff, la liste des notes ou la barre latérale,
-    cette fonction retourne False.
+    Retourne False dès que l'événement cible le panneau de diff (menu diff), la table des cartes ou la barre latérale.
+    Retourne True si l'événement cible un champ éditable de l'éditeur Anki ou un widget de saisie texte (QLineEdit/QTextEdit non-lecture seule).
     """
+    if panel is None:
+        return False
+
     browser = getattr(panel, "_browser", None)
     if browser is None:
         return False
 
-    app = QtWidgets.QApplication.instance()
-    if app is None:
+    editor = getattr(browser, "editor", None)
+
+    # Helper pour tester si un widget est ou appartient a la table des cartes
+    def _is_table_widget(w: Optional[QtCore.QObject]) -> bool:
+        if w is None or not isinstance(w, QtWidgets.QWidget):
+            return False
+        table = getattr(browser, "table", None)
+        table_view = getattr(table, "_view", None) if table is not None else getattr(getattr(browser, "form", None), "tableView", None)
+        if table_view is None and isinstance(table, QtWidgets.QAbstractItemView):
+            table_view = table
+        if table is not None and (w is table or (isinstance(table, QtWidgets.QWidget) and table.isAncestorOf(w))):
+            return True
+        if table_view is not None and (w is table_view or (isinstance(table_view, QtWidgets.QWidget) and table_view.isAncestorOf(w))):
+            return True
         return False
 
-    cursor_pos = QtGui.QCursor.pos()
-    widget_under_mouse = app.widgetAt(cursor_pos)
-
-    # 1. Si la souris pointe sur le panneau de diff : pas dans un champ
-    if widget_under_mouse is not None:
-        try:
-            if panel is widget_under_mouse or panel.isAncestorOf(widget_under_mouse):
-                return False
-        except Exception:
-            pass
-
-        # Si la souris pointe sur la table des notes ou la barre latérale : pas dans un champ
-        try:
-            table = getattr(browser, "table", None)
-            if table is not None and (table is widget_under_mouse or table.isAncestorOf(widget_under_mouse)):
-                return False
-            sidebar = getattr(browser, "sidebar", None)
-            if sidebar is not None and (sidebar is widget_under_mouse or sidebar.isAncestorOf(widget_under_mouse)):
-                return False
-        except Exception:
-            pass
-
-    # 2. Si un widget Qt de saisie standard a le focus (ex: champ de recherche, tags)
-    focus_w = app.focusWidget()
-    if focus_w is not None and isinstance(focus_w, (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)):
-        try:
-            if not (panel is focus_w or panel.isAncestorOf(focus_w)):
-                return True
-        except Exception:
+    def _is_sidebar_widget(w: Optional[QtCore.QObject]) -> bool:
+        if w is None or not isinstance(w, QtWidgets.QWidget):
+            return False
+        sidebar = getattr(browser, "sidebar", None)
+        if sidebar is not None and (w is sidebar or (isinstance(sidebar, QtWidgets.QWidget) and sidebar.isAncestorOf(w))):
             return True
+        return False
 
-    # 3. Vérifier l'éditeur natif Anki
-    editor = getattr(browser, "editor", None)
+    # 1. Inspecter l'objet recepteur de l'evenement si fourni
+    if obj is not None and isinstance(obj, QtWidgets.QWidget):
+        try:
+            # Si l'evenement vise le panneau diff ou l'un de ses widgets -> PAS dans un champ editable (False absolu)
+            if obj is panel or panel.isAncestorOf(obj):
+                return False
+
+            # Si l'evenement vise la table des cartes ou la barre laterale -> False
+            if _is_table_widget(obj) or _is_sidebar_widget(obj):
+                return False
+
+            # Si l'evenement vise un widget Qt standard de saisie (ex: recherche, tags)
+            if isinstance(obj, (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)):
+                if not getattr(obj, "isReadOnly", lambda: False)():
+                    return True
+
+            # Si l'evenement vise le webview de l'editeur Anki
+            web = getattr(editor, "web", None) if editor else None
+            if web is not None and (obj is web or web.isAncestorOf(obj)):
+                cf = getattr(editor, "currentField", None)
+                return isinstance(cf, int)
+        except Exception:
+            pass
+
+    # 2. Si aucun objet recepteur n'est fourni ou s'il n'a pas permis de trancher
+    app = QtWidgets.QApplication.instance()
+    focus_w = app.focusWidget() if app else None
+
+    if focus_w is not None and isinstance(focus_w, QtWidgets.QWidget):
+        try:
+            if focus_w is panel or panel.isAncestorOf(focus_w):
+                return False
+            if _is_table_widget(focus_w) or _is_sidebar_widget(focus_w):
+                return False
+            if isinstance(focus_w, (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)):
+                if not getattr(focus_w, "isReadOnly", lambda: False)():
+                    return True
+            web = getattr(editor, "web", None) if editor else None
+            if web is not None and (focus_w is web or web.isAncestorOf(focus_w)):
+                cf = getattr(editor, "currentField", None)
+                return isinstance(cf, int)
+        except Exception:
+            pass
+
+    # 3. Vérifier l'état de l'éditeur Anki (fallback quand appelé directement sans obj)
     if editor is not None:
-        web = getattr(editor, "web", None)
-        # Si la souris pointe explicitement sur la webview de l'éditeur ou si un champ a le focus
-        if getattr(editor, "currentField", None) is not None:
+        cf = getattr(editor, "currentField", None)
+        if isinstance(cf, int):
             return True
 
     return False
@@ -573,6 +634,11 @@ def _trigger_copy_nid(panel: Any, browser: Any) -> None:
             c = browser.col.get_card(browser.selected_cards()[0])
             nid = str(c.nid)
         if nid:
+            try:
+                from .temp_link_interceptor import TempLinkInterceptor
+                TempLinkInterceptor.instance().register_copied_nid(nid)
+            except Exception:
+                pass
             mime = QMimeData()
             mime.setText(nid)
             app = QApplication.instance()
@@ -662,7 +728,7 @@ class DiffGlobalEventFilter(QtCore.QObject):
             try:
                 assistant_dock = getattr(browser, "_edn_assistant_dock", None)
                 if assistant_dock is not None:
-                    if obj is assistant_dock or assistant_dock.isAncestorOf(obj) or (isinstance(obj, QtWidgets.QWidget) and obj.window() is assistant_dock):
+                    if isinstance(obj, QtWidgets.QWidget) and (obj is assistant_dock or assistant_dock.isAncestorOf(obj) or obj.window() is assistant_dock):
                         is_in_browser = True
             except Exception:
                 pass
@@ -694,6 +760,10 @@ class DiffGlobalEventFilter(QtCore.QObject):
 
         # Raccourci Echap : fermer la revue de diff avec confirmation
         is_escape = (key == QtCore.Qt.Key.Key_Escape and not (has_alt or has_ctrl or has_shift))
+
+        # Flèches de déplacement vers le haut / le bas (sans modificateurs)
+        is_up = (key == QtCore.Qt.Key.Key_Up and not (has_alt or has_ctrl or has_shift))
+        is_down = (key == QtCore.Qt.Key.Key_Down and not (has_alt or has_ctrl or has_shift))
 
         # Raccourcis Accepter : F2, Alt+A, Alt+V, Alt+Y, Ctrl+Alt+A, Ctrl+Shift+A
         is_accept = (
@@ -728,14 +798,38 @@ class DiffGlobalEventFilter(QtCore.QObject):
             has_ctrl and has_alt and not has_shift and key == QtCore.Qt.Key.Key_C
         )
 
-        if not (is_accept or is_reject or is_history or is_copy or is_copy_nid or is_escape):
+        if not (is_accept or is_reject or is_history or is_copy or is_copy_nid or is_escape or is_up or is_down):
             return False
 
         # F2, F3 et Escape sont des touches fonctionnelles dédiées : elles doivent TOUJOURS fonctionner
         # peu importe la cible ou le focus de l'utilisateur (parcourir, éditeur, champ texte, menu latéral liens, menu latéral diff...).
-        # Seuls les raccourcis textuels basés sur des lettres (Alt+A, Alt+R, Alt+C, etc.) sont ignorés quand l'utilisateur est dans un champ de saisie texte.
+        # Seuls les raccourcis textuels basés sur des lettres (Alt+A, Alt+R, Alt+C, etc.) ainsi que les flèches haut/bas
+        # sont ignorés quand l'utilisateur est dans un champ de saisie texte (pour permettre l'édition et la navigation dans le texte).
         if not (is_f2 or is_f3 or is_escape):
-            if _is_inside_field(panel):
+            if _is_inside_field(panel, obj):
+                return False
+
+        # Si le focus ou la cible de l'evenement est directement sur la table des cartes (tableView),
+        # laisser le comportement natif de la table pour les touches flechees (eviter tout conflit ou double saut)
+        if is_up or is_down:
+            table = getattr(browser, "table", None)
+            table_view = getattr(table, "_view", None) if table is not None else None
+            if table_view is None and hasattr(browser, "form") and hasattr(browser.form, "tableView"):
+                table_view = browser.form.tableView
+            if table_view is None and isinstance(table, QtWidgets.QAbstractItemView):
+                table_view = table
+
+            focus_w = app.focusWidget()
+            is_table_event = False
+            for w in (obj, focus_w):
+                if w is not None and isinstance(w, QtWidgets.QWidget):
+                    if table is not None and (w is table or (isinstance(table, QtWidgets.QWidget) and table.isAncestorOf(w))):
+                        is_table_event = True
+                        break
+                    if table_view is not None and (w is table_view or (isinstance(table_view, QtWidgets.QWidget) and table_view.isAncestorOf(w))):
+                        is_table_event = True
+                        break
+            if is_table_event:
                 return False
 
         now = time.monotonic()
@@ -754,6 +848,10 @@ class DiffGlobalEventFilter(QtCore.QObject):
                 _trigger_copy_nid(panel, browser)
             elif is_escape:
                 panel._on_request_close_panel()
+            elif is_up:
+                panel._select_previous_card()
+            elif is_down:
+                panel._select_next_card()
             event.accept()
             return True
         else:
@@ -775,6 +873,10 @@ class DiffGlobalEventFilter(QtCore.QObject):
                 _trigger_copy_nid(panel, browser)
             elif is_escape:
                 panel._on_request_close_panel()
+            elif is_up:
+                panel._select_previous_card()
+            elif is_down:
+                panel._select_next_card()
             event.accept()
             return True
 
@@ -799,6 +901,39 @@ class DiffBrowserPanel(QtWidgets.QWidget):
     se cache, incluant notre panel. La visibilite reste coherente.
     """
 
+class _LazyNotePanelsDict(dict):
+    """Dictionnaire à instanciation paresseuse pour les panels NoteDiffPanelWithSync."""
+    def __init__(self, panel_container):
+        super().__init__()
+        self._panel_container = panel_container
+
+    def __missing__(self, nid):
+        res = self._panel_container._get_or_create_panel(nid)
+        if res is not None:
+            return res
+        raise KeyError(nid)
+
+    def __getitem__(self, nid):
+        if nid in self:
+            return super().__getitem__(nid)
+        return self.__missing__(nid)
+
+    def get(self, nid, default=None):
+        if nid in self:
+            return super().get(nid)
+        try:
+            res = self._panel_container._get_or_create_panel(nid)
+            if res is not None:
+                return res
+        except Exception:
+            pass
+        return default
+
+class DiffBrowserPanel(QtWidgets.QWidget):
+    """
+    Panel de diff docké dans l'explorateur Anki.
+    """
+
     def __init__(self, browser):
         super().__init__(browser)
         self.setObjectName("diffBrowserPanel")
@@ -806,7 +941,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         self._current_nid: Optional[int] = None
         self._last_diff_nid: Optional[int] = None
         self._current_editor = None  # reference a l'editeur actif dans le browser
-        self._note_panels: Dict[int, "NoteDiffPanelWithSync"] = {}  # note_id -> panel
+        self._note_panels: Dict[int, "NoteDiffPanelWithSync"] = _LazyNotePanelsDict(self)  # note_id -> panel
         self._editor_diff_splitter: Optional[QtWidgets.QSplitter] = None  # splitter injecte
         self._original_splitter_widget: Optional[QtWidgets.QWidget] = None  # fieldsArea original
         self._pre_diff_main_splitter_sizes: Optional[List[int]] = None
@@ -827,6 +962,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         # Hooks
         gui_hooks.browser_did_change_row.append(self._on_browser_row_changed)
         self._install_field_edit_hook()
+        _patch_editor_save_for_diff()
 
     def _inject_into_browser_splitter(self) -> None:
         """
@@ -980,10 +1116,179 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         except Exception:
             pass
 
+        # Navigation de carte via les fleches haut / bas
+        for key, callback in (
+            (QtCore.Qt.Key.Key_Up, self._select_previous_card),
+            (QtCore.Qt.Key.Key_Down, self._select_next_card),
+        ):
+            try:
+                sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+                sc.setContext(_Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                sc.activated.connect(callback)
+                self._shortcuts.append(sc)
+            except Exception:
+                pass
+
         # Si l'editeur du navigateur existe deja, injecter les raccourcis dans sa webview
         editor = getattr(self._browser, "editor", None)
         if editor:
             _inject_editor_web_shortcuts(editor)
+
+    def _select_previous_card(self) -> None:
+        """Sélectionne la carte précédente (au-dessus) dans l'explorateur Anki."""
+        self._navigate_card_relative(-1)
+
+    def _select_next_card(self) -> None:
+        """Sélectionne la carte suivante (en-dessous) dans l'explorateur Anki."""
+        self._navigate_card_relative(1)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        key = event.key()
+        mods = event.modifiers()
+        if not (mods & (_Qt.KeyboardModifier.ControlModifier | _Qt.KeyboardModifier.AltModifier | _Qt.KeyboardModifier.ShiftModifier)):
+            if key == _Qt.Key.Key_Up:
+                self._select_previous_card()
+                event.accept()
+                return
+            elif key == _Qt.Key.Key_Down:
+                self._select_next_card()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def _navigate_card_relative(self, delta: int) -> None:
+        """
+        Déplace la sélection d'une ligne vers le haut (delta = -1) ou vers le bas (delta = 1)
+        dans la table de l'explorateur Anki et met à jour l'affichage du diff.
+        """
+        now = time.monotonic()
+        if hasattr(self, "_last_nav_time") and (now - self._last_nav_time) < 0.08:
+            return
+        self._last_nav_time = now
+
+        browser = getattr(self, "_browser", None)
+        if browser is None:
+            return
+
+        try:
+            from aqt.qt import sip
+            if sip.isdeleted(browser):
+                return
+        except Exception:
+            return
+
+        table = getattr(browser, "table", None)
+        table_view = getattr(table, "_view", None) if table is not None else None
+        if table_view is None and hasattr(browser, "form") and hasattr(browser.form, "tableView"):
+            table_view = browser.form.tableView
+
+        # 1. Utiliser en priorité l'API officielle table.to_previous_row / table.to_next_row
+        if table is not None:
+            try:
+                has_curr = False
+                if hasattr(table, "has_current"):
+                    has_curr = table.has_current()
+                elif table_view is not None and table_view.selectionModel() is not None:
+                    has_curr = table_view.selectionModel().currentIndex().isValid()
+
+                if not has_curr:
+                    if table_view is not None:
+                        sm = table_view.selectionModel()
+                        m = table_view.model()
+                        if sm is not None and m is not None and m.rowCount() > 0:
+                            target_row = 0 if delta > 0 else m.rowCount() - 1
+                            new_idx = m.index(target_row, 0)
+                            table_view.setCurrentIndex(new_idx)
+                            sm.select(
+                                new_idx,
+                                QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                                | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                            )
+                            try:
+                                table_view.scrollTo(new_idx, QtWidgets.QAbstractItemView.ScrollHint.EnsureVisible)
+                            except Exception:
+                                pass
+                            if hasattr(self, "_on_browser_row_changed"):
+                                self._on_browser_row_changed(browser)
+                    elif delta > 0 and hasattr(table, "to_first_row"):
+                        table.to_first_row()
+                    elif delta < 0 and hasattr(table, "to_last_row"):
+                        table.to_last_row()
+                    return
+
+                if delta < 0:
+                    if hasattr(table, "has_previous") and table.has_previous():
+                        table.to_previous_row()
+                        if table_view is not None:
+                            try:
+                                table_view.scrollTo(table_view.currentIndex(), QtWidgets.QAbstractItemView.ScrollHint.EnsureVisible)
+                            except Exception:
+                                pass
+                        if hasattr(self, "_on_browser_row_changed"):
+                            self._on_browser_row_changed(browser)
+                        return
+                    elif not hasattr(table, "has_previous") and hasattr(table, "to_previous_row"):
+                        table.to_previous_row()
+                        if table_view is not None:
+                            try:
+                                table_view.scrollTo(table_view.currentIndex(), QtWidgets.QAbstractItemView.ScrollHint.EnsureVisible)
+                            except Exception:
+                                pass
+                        if hasattr(self, "_on_browser_row_changed"):
+                            self._on_browser_row_changed(browser)
+                        return
+                elif delta > 0:
+                    if hasattr(table, "has_next") and table.has_next():
+                        table.to_next_row()
+                        if table_view is not None:
+                            try:
+                                table_view.scrollTo(table_view.currentIndex(), QtWidgets.QAbstractItemView.ScrollHint.EnsureVisible)
+                            except Exception:
+                                pass
+                        if hasattr(self, "_on_browser_row_changed"):
+                            self._on_browser_row_changed(browser)
+                        return
+                    elif not hasattr(table, "has_next") and hasattr(table, "to_next_row"):
+                        table.to_next_row()
+                        if table_view is not None:
+                            try:
+                                table_view.scrollTo(table_view.currentIndex(), QtWidgets.QAbstractItemView.ScrollHint.EnsureVisible)
+                            except Exception:
+                                pass
+                        if hasattr(self, "_on_browser_row_changed"):
+                            self._on_browser_row_changed(browser)
+                        return
+            except Exception as e:
+                print(f"[anki-diff] _navigate_card_relative table error: {e}")
+
+        # 2. Fallback direct via table_view (QTableView / QItemSelectionModel)
+        if table_view is not None:
+            try:
+                sm = table_view.selectionModel()
+                m = table_view.model()
+                if sm is not None and m is not None:
+                    cur = sm.currentIndex()
+                    row_count = m.rowCount()
+                    if row_count > 0:
+                        cur_row = cur.row() if cur.isValid() else (-1 if delta > 0 else row_count)
+                        target_row = max(0, min(row_count - 1, cur_row + delta))
+                        if target_row != cur_row:
+                            col_idx = cur.column() if cur.isValid() and cur.column() >= 0 else 0
+                            new_idx = m.index(target_row, col_idx)
+                            table_view.setCurrentIndex(new_idx)
+                            sm.select(
+                                new_idx,
+                                QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                                | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                            )
+                            try:
+                                table_view.scrollTo(new_idx, QtWidgets.QAbstractItemView.ScrollHint.EnsureVisible)
+                            except Exception:
+                                pass
+                            if hasattr(self, "_on_browser_row_changed"):
+                                self._on_browser_row_changed(browser)
+            except Exception as e:
+                print(f"[anki-diff] _navigate_card_relative view error: {e}")
 
     def _toggle_history_tab(self) -> None:
         """Bascule entre l'onglet Diff (0) et l'onglet Historique (1)."""
@@ -1122,6 +1427,8 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         except (ValueError, RuntimeError, KeyError):
             pass
 
+        _restore_editor_save()
+
         # 1. Supprimer les notes INSERT pré-insérées (staged)
         # 2. Restaurer les notes UPDATE à leur état d'origine
         global _committed, _pending_diffs
@@ -1131,6 +1438,17 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                 _unstage_insert_notes(_pending_diffs)
             except Exception as e:
                 print(f"[anki-diff] Error unstaging INSERT notes: {e}")
+
+            # Nettoyer les liens morts pointant vers les notes annulées
+            try:
+                from .temp_link_interceptor import TempLinkInterceptor
+                TempLinkInterceptor.instance().on_diff_session_closed(
+                    col=aqt.mw.col if (hasattr(aqt, "mw") and aqt.mw) else None,
+                    browser=self._browser,
+                    committed=False
+                )
+            except Exception as e_interceptor:
+                print(f"[anki-diff] Error closing temp_link_interceptor on rollback: {e_interceptor}")
 
             restored_count = 0
             try:
@@ -1146,7 +1464,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                                 continue
                             field_indices = {f["name"]: idx for idx, f in enumerate(model.get("flds", []))}
 
-                            # Restaurer chaque champ d'origine
+                            # Restaurer chaque champ et les tags d'origine
                             modified = False
                             for name, orig_val in diff.original_fields.items():
                                 idx = field_indices.get(name)
@@ -1154,6 +1472,10 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                                     if note.fields[idx] != orig_val:
                                         note.fields[idx] = orig_val
                                         modified = True
+                            orig_tags = list(diff.original_tags) if hasattr(diff, "original_tags") and diff.original_tags is not None else []
+                            if list(getattr(note, "tags", [])) != orig_tags:
+                                note.tags = orig_tags
+                                modified = True
                             if modified:
                                 col.update_note(note)  # gère sa propre transaction Rust
                                 restored_count += 1
@@ -1203,8 +1525,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                         btn = fp._btn_accept_all
                         fp._btn_accept_all = None
                         if not sip.isdeleted(btn):
-                            btn.clicked.disconnect()
-                            sip.delete(btn)
+                            btn.deleteLater()
                     except Exception:
                         pass
                 if hasattr(fp, "_btn_reject_all") and fp._btn_reject_all is not None:
@@ -1212,14 +1533,9 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                         btn = fp._btn_reject_all
                         fp._btn_reject_all = None
                         if not sip.isdeleted(btn):
-                            btn.clicked.disconnect()
-                            sip.delete(btn)
+                            btn.deleteLater()
                     except Exception:
                         pass
-                try:
-                    fp.previewChanged.disconnect()
-                except Exception:
-                    pass
         if hasattr(self, "_event_filter") and self._event_filter is not None:
             app = QtWidgets.QApplication.instance()
             if app:
@@ -1244,8 +1560,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                     btn = getattr(self, btn_attr)
                     setattr(self, btn_attr, None)
                     if not sip.isdeleted(btn):
-                        btn.clicked.disconnect()
-                        sip.delete(btn)
+                        btn.deleteLater()
                 except Exception:
                     pass
         if hasattr(self, "_tabs") and self._tabs is not None:
@@ -1254,7 +1569,19 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                     self._tabs.currentChanged.disconnect(self._on_tab_changed)
             except Exception:
                 pass
-            pass
+
+        # Restaurer closeEvent et keyPressEvent d'origine sur le navigateur
+        browser = getattr(self, "_browser", None)
+        if browser is not None:
+            try:
+                if hasattr(browser, "_orig_diff_close_event") and browser._orig_diff_close_event is not None:
+                    browser.closeEvent = browser._orig_diff_close_event
+                    browser._orig_diff_close_event = None
+                if hasattr(browser, "_orig_diff_key_press_event") and browser._orig_diff_key_press_event is not None:
+                    browser.keyPressEvent = browser._orig_diff_key_press_event
+                    browser._orig_diff_key_press_event = None
+            except Exception:
+                pass
 
     # ── Construction ────────────────────────────────────────────────────────
 
@@ -1424,20 +1751,30 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         self._update_status()
 
     def _build_note_panels(self):
-        for diff in _pending_diffs.values():
-            panel = NoteDiffPanelWithSync(diff, self, self._diff_stack)
-            self._note_panels[diff.note_id] = panel
-            if diff.staged_note_id:
-                self._note_panels[diff.staged_note_id] = panel
-            self._diff_stack.addWidget(panel)
+        self._note_panels.clear()
+        self._not_in_diff_widget = self._create_not_in_diff_widget()
+        self._diff_stack.addWidget(self._not_in_diff_widget)
 
         if _pending_diffs and self._last_diff_nid is None:
             first_diff = next(iter(_pending_diffs.values()), None)
             if first_diff:
                 self._last_diff_nid = first_diff.staged_note_id if (first_diff.action == "INSERT" and first_diff.staged_note_id) else first_diff.note_id
 
-        self._not_in_diff_widget = self._create_not_in_diff_widget()
-        self._diff_stack.addWidget(self._not_in_diff_widget)
+    def _get_or_create_panel(self, nid: int) -> Optional[NoteDiffPanelWithSync]:
+        if nid in self._note_panels:
+            return self._note_panels[nid]
+        orig_id = _staged_to_orig.get(nid, nid)
+        if orig_id in self._note_panels:
+            return self._note_panels[orig_id]
+        diff = _pending_diffs.get(orig_id) or _pending_diffs.get(nid)
+        if not diff:
+            return None
+        panel = NoteDiffPanelWithSync(diff, self, self._diff_stack)
+        self._note_panels[diff.note_id] = panel
+        if diff.staged_note_id:
+            self._note_panels[diff.staged_note_id] = panel
+        self._diff_stack.addWidget(panel)
+        return panel
 
     def _create_not_in_diff_widget(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -1644,19 +1981,14 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         if nid is None:
             return
 
+        panel = self._get_or_create_panel(nid)
         panel_nid = nid
-        if panel_nid not in self._note_panels:
-            orig_id = _staged_to_orig.get(nid)
-            if orig_id is not None and orig_id in self._note_panels:
-                panel_nid = orig_id
-
-        self._current_nid = panel_nid
-
-        if panel_nid in self._note_panels:
+        if panel is not None:
+            panel_nid = panel._diff.note_id
+            self._current_nid = panel_nid
             self._last_diff_nid = panel_nid
-            target_widget = self._note_panels[panel_nid]
-            if self._diff_stack.currentWidget() != target_widget:
-                self._diff_stack.setCurrentWidget(target_widget)
+            if self._diff_stack.currentWidget() != panel:
+                self._diff_stack.setCurrentWidget(panel)
 
             nids = [d.note_id for d in _pending_diffs.values()]
             try:
@@ -1665,6 +1997,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
             except (ValueError, AttributeError):
                 pass
         else:
+            self._current_nid = panel_nid
             if hasattr(self, "_not_in_diff_widget") and self._not_in_diff_widget is not None:
                 title = f"Note {nid}"
                 try:
@@ -1686,8 +2019,8 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                     self._not_in_diff_title.setText(title)
                 self._diff_stack.setCurrentWidget(self._not_in_diff_widget)
 
-        # Toujours actualiser l'historique si l'onglet est actif ou initialisé
-        if hasattr(self, "_tabs") and (self._tabs.currentIndex() == 1 or self._history_tab_widget is not None):
+        # Actualiser l'historique uniquement si l'onglet Historique est actuellement visible
+        if hasattr(self, "_tabs") and self._tabs.currentIndex() == 1:
             try:
                 self._show_history_for_note(nid)
             except Exception:
@@ -1845,7 +2178,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                 except Exception:
                     pass
 
-            if nid is not None:
+            if nid is not None and nid != self._current_nid:
                 self.select_note(nid)
         except Exception as e:
             print(f"[anki-diff] _on_browser_row_changed error: {e}")
@@ -1878,7 +2211,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
             _inject_editor_web_shortcuts(editor)
         note = _get_editor_note(editor)
         if note and getattr(note, "id", None):
-            diff = _pending_diffs.get(note.id)
+            diff = get_diff_for_note(note.id)
             if diff:
                 panel = self._note_panels.get(diff.note_id)
                 if panel:
@@ -1887,13 +2220,16 @@ class DiffBrowserPanel(QtWidgets.QWidget):
 
     def get_editor_for_note(self, note_id: int):
         """Retourne l'éditeur courant si sa note correspond à note_id."""
+        real_target_nid = _staged_to_orig.get(note_id, note_id)
         # Priorité 1 : éditeur enregistré via hook
         if self._current_editor:
-            nid = getattr(self._current_editor, "nid", None)
-            if nid == note_id:
-                return self._current_editor
             note = _get_editor_note(self._current_editor)
-            if note and getattr(note, "id", None) == note_id:
+            if note and getattr(note, "id", None):
+                real_ed_nid = _staged_to_orig.get(note.id, note.id)
+                if real_ed_nid == real_target_nid or note.id == note_id:
+                    return self._current_editor
+            nid = getattr(self._current_editor, "nid", None)
+            if nid and (_staged_to_orig.get(nid, nid) == real_target_nid or nid == note_id):
                 return self._current_editor
         # Priorité 2 : accès direct à browser.editor (contourne le problème de timing)
         return self._get_browser_editor_for_note(note_id)
@@ -1901,13 +2237,18 @@ class DiffBrowserPanel(QtWidgets.QWidget):
     def _get_browser_editor_for_note(self, note_id: int):
         """Accès direct à browser.editor — fiable même si le hook n'a pas encore tiré."""
         try:
-            ed = self._browser.editor
+            ed = getattr(self._browser, "editor", None)
             if ed:
-                nid = getattr(ed, "nid", None)
-                if nid == note_id:
-                    return ed
+                real_target_nid = _staged_to_orig.get(note_id, note_id)
                 note = _get_editor_note(ed)
-                if note and getattr(note, "id", None) == note_id:
+                if note and getattr(note, "id", None):
+                    real_ed_nid = _staged_to_orig.get(note.id, note.id)
+                    if real_ed_nid == real_target_nid or note.id == note_id:
+                        return ed
+                nid = getattr(ed, "nid", None)
+                if nid and (_staged_to_orig.get(nid, nid) == real_target_nid or nid == note_id):
+                    return ed
+                if getattr(self, "_current_nid", None) in (note_id, real_target_nid) and note:
                     return ed
         except Exception:
             pass
@@ -1929,14 +2270,14 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                 if len(selected) > 1:
                     for nid in selected:
                         real_nid = _staged_to_orig.get(nid, nid)
-                        p = self._note_panels.get(real_nid)
+                        p = self._get_or_create_panel(real_nid)
                         if p and p not in targets:
                             targets.append(p)
                     if targets:
                         return targets
                 elif len(selected) == 1:
                     real_nid = _staged_to_orig.get(selected[0], selected[0])
-                    p = self._note_panels.get(real_nid)
+                    p = self._get_or_create_panel(real_nid)
                     if p:
                         return [p]
         except Exception:
@@ -1950,15 +2291,21 @@ class DiffBrowserPanel(QtWidgets.QWidget):
 
     def _get_current_panel(self) -> Optional["NoteDiffPanelWithSync"]:
         """Retourne le panel de la note actuellement affichée dans le stack."""
-        if self._current_nid is not None and self._current_nid in self._note_panels:
-            return self._note_panels[self._current_nid]
+        if self._current_nid is not None:
+            p = self._note_panels.get(self._current_nid)
+            if p is not None:
+                return p
         curr_widget = self._diff_stack.currentWidget()
         if isinstance(curr_widget, NoteDiffPanelWithSync):
             return curr_widget
-        idx = self._diff_stack.currentIndex()
-        nids = list(self._note_panels.keys())
-        if 0 <= idx < len(nids):
-            return self._note_panels[nids[idx]]
+        if self._last_diff_nid is not None:
+            p = self._note_panels.get(self._last_diff_nid)
+            if p is not None:
+                return p
+        if _pending_diffs:
+            first_diff = next(iter(_pending_diffs.values()), None)
+            if first_diff:
+                return self._note_panels.get(first_diff.note_id)
         return None
 
     def _accept_all_current(self):
@@ -1966,19 +2313,13 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         panels = self._get_target_panels()
         for panel in panels:
             panel.accept_all_hunks()
-            try:
-                real_nid = _staged_to_orig.get(panel._diff.note_id, panel._diff.note_id)
-                diff = _pending_diffs.get(real_nid)
-                if diff:
-                    diff.excluded = False
-                    diff.custom_edit_fields.clear()
-                    diff.tags = list(diff.updated_tags)
-                    diff.tags_active_target = "PROP"
-                    for fn in diff.field_names:
-                        diff.merged_fields[fn] = diff.updated_fields.get(fn, "")
-            except Exception:
-                pass
         self._update_status()
+        try:
+            if hasattr(self._browser, "_previewer") and self._browser._previewer:
+                self._browser._previewer._last_state = None
+                self._browser._renderPreview()
+        except Exception:
+            pass
 
     def _reject_all_current(self):
         """Rejeter tous les champs de la note en cours ou de la multi-sélection."""
@@ -1987,15 +2328,13 @@ class DiffBrowserPanel(QtWidgets.QWidget):
             if getattr(panel._diff, "action", "") == "INSERT":
                 continue
             panel.reject_all_hunks()
-            try:
-                real_nid = _staged_to_orig.get(panel._diff.note_id, panel._diff.note_id)
-                diff = _pending_diffs.get(real_nid)
-                if diff:
-                    diff.tags = list(diff.original_tags)
-                    diff.tags_active_target = "OLD"
-            except Exception:
-                pass
         self._update_status()
+        try:
+            if hasattr(self._browser, "_previewer") and self._browser._previewer:
+                self._browser._previewer._last_state = None
+                self._browser._renderPreview()
+        except Exception:
+            pass
 
     def _accept_all_global(self):
         """Accepter tous les champs de toutes les notes (non exposé dans l'UI, gardé pour compatibilité)."""
@@ -2050,6 +2389,13 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                 diff.merged_fields = panel.get_merged_fields()
 
         accepted = list(_pending_diffs.values())
+
+        # Mettre à jour les NIDs temporaires dans les merged_fields avant commit
+        try:
+            from .temp_link_interceptor import TempLinkInterceptor
+            TempLinkInterceptor.instance().update_pending_diffs(accepted)
+        except Exception:
+            pass
 
         global _committed
         _committed = True
@@ -2379,6 +2725,7 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
         """Accepte tous les hunks de tous les champs et synce l'editeur une seule fois."""
         self._include_cb.setChecked(True)
         self._diff.custom_edit_fields.clear()
+        self._diff.excluded = False
         for fp in self._field_panels.values():
             fp.active_target = "PROP"
             self._diff.field_active_target[fp.field_name] = "PROP"
@@ -2392,8 +2739,12 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
                 fp._refresh_display()
             elif hasattr(fp, "_update_badge_and_buttons"):
                 fp._update_badge_and_buttons()
-        for fname, fp in self._field_panels.items():
-            self._diff.merged_fields[fname] = fp.get_merged_value()
+        for fname in self._diff.field_names:
+            fp = self._field_panels.get(fname)
+            if fp is not None:
+                self._diff.merged_fields[fname] = fp.get_merged_value()
+            else:
+                self._diff.merged_fields[fname] = self._diff.updated_fields.get(fname, "")
 
         self._diff.tags = list(self._diff.updated_tags)
         self._diff.tags_active_target = "PROP"
@@ -2422,11 +2773,15 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
                 fp._refresh_display()
             elif hasattr(fp, "_update_badge_and_buttons"):
                 fp._update_badge_and_buttons()
-        for fname, fp in self._field_panels.items():
+        for fname in self._diff.field_names:
             if fname in self._diff.custom_edit_fields:
                 self._diff.merged_fields[fname] = self._diff.custom_edit_fields[fname]
             else:
-                self._diff.merged_fields[fname] = fp.get_merged_value()
+                fp = self._field_panels.get(fname)
+                if fp is not None:
+                    self._diff.merged_fields[fname] = fp.get_merged_value()
+                else:
+                    self._diff.merged_fields[fname] = self._diff.original_fields.get(fname, "")
 
         self._diff.tags = list(self._diff.original_tags)
         self._diff.tags_active_target = "OLD"
@@ -2453,6 +2808,61 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
 _editor_note_cache: Dict[int, dict] = {}
 _editor_last_snapshot: Dict[int, tuple[float, str]] = {}  # note_id -> (timestamp, version_id)
 
+_orig_editor_save_current_note = None
+
+
+def _diff_save_current_note(editor_self) -> None:
+    """
+    Remplacement de Editor._save_current_note pendant la session de diff.
+    Effectue une mise à jour synchrone directe en base SQLite (0.1ms) uniquement
+    pour les notes appartenant à la session de diff active.
+    Délègue toutes les autres notes (AddCards, EditCurrent, notes hors diff) à la
+    méthode d'origine d'Anki.
+    """
+    if not editor_self.note:
+        return
+    note_id = getattr(editor_self.note, "id", 0)
+    if _browser_panel is not None and _pending_diffs and get_diff_for_note(note_id) is not None:
+        try:
+            col = getattr(editor_self, "mw", None) and getattr(editor_self.mw, "col", None)
+            if col:
+                col.update_note(editor_self.note)
+            parent_win = getattr(editor_self, "parentWindow", None)
+            browser = parent_win if hasattr(parent_win, "_previewer") else None
+            if browser and hasattr(browser, "_previewer") and browser._previewer:
+                browser._previewer._last_state = None
+                browser._renderPreview()
+            return
+        except Exception:
+            pass
+    if _orig_editor_save_current_note:
+        _orig_editor_save_current_note(editor_self)
+
+
+def _patch_editor_save_for_diff() -> None:
+    global _orig_editor_save_current_note
+    try:
+        from aqt.editor import Editor
+        if hasattr(Editor, "_save_current_note") and _orig_editor_save_current_note is None:
+            _orig_editor_save_current_note = Editor._save_current_note
+            Editor._save_current_note = _diff_save_current_note
+    except Exception:
+        pass
+
+
+def _restore_editor_save() -> None:
+    global _orig_editor_save_current_note
+    try:
+        from aqt.editor import Editor
+        if _orig_editor_save_current_note is not None:
+            Editor._save_current_note = _orig_editor_save_current_note
+            _orig_editor_save_current_note = None
+    except Exception:
+        pass
+
+
+
+
 
 def _on_editor_did_load_note(editor) -> None:
     """
@@ -2469,6 +2879,8 @@ def _on_editor_did_load_note(editor) -> None:
     try:
         _editor_note_cache[note.id] = {
             'fields': {name: val for name, val in note.items()},
+            'tags': list(note.tags) if hasattr(note, "tags") and note.tags else [],
+            'mod': getattr(note, "mod", None),
             'timestamp': time.time()
         }
     except Exception:
@@ -2480,7 +2892,8 @@ def _on_editor_did_load_note(editor) -> None:
             from aqt.qt import sip
             if not sip.isdeleted(_browser_panel):
                 _browser_panel.set_current_editor(editor)
-                _browser_panel.select_note(note.id)
+                if getattr(_browser_panel, "_current_nid", None) != note.id:
+                    _browser_panel.select_note(note.id)
         except Exception:
             pass
 
@@ -2523,27 +2936,41 @@ def _on_editor_did_unfocus_field(changed: bool, note_or_editor, current_field_id
         has_changes = any(old_fields.get(k) != v for k, v in current_fields.items()) or any(k not in old_fields for k in current_fields)
 
         if has_changes:
-            # Mettre à jour le cache mémoire
-            _editor_note_cache[note.id] = {
-                'fields': current_fields,
-                'timestamp': time.time()
-            }
-
             from .history import NoteHistoryDB
             db = NoteHistoryDB.instance()
             now_ts = time.time()
             tags = list(note.tags) if hasattr(note, "tags") and note.tags else []
 
-            dedup_window = 300.0  # 5 minutes
+            # 1. Garantir que l'état initial (avant modification dans cette session)
+            # est persisté comme baseline immuable dans l'historique
+            try:
+                db.ensure_baseline_snapshot(
+                    note_id=note.id,
+                    fields=old_fields,
+                    tags=cached.get('tags', tags),
+                    mod_time=cached.get('mod'),
+                )
+            except Exception as e_base:
+                print(f"[anki-diff] Error ensuring baseline: {e_base}")
+
+            # Mettre à jour le cache mémoire
+            _editor_note_cache[note.id] = {
+                'fields': current_fields,
+                'tags': tags,
+                'mod': cached.get('mod'),
+                'timestamp': now_ts,
+            }
+
+            dedup_window = 900.0  # 15 minutes (durée d'une séance d'édition continue)
             last_info = _editor_last_snapshot.get(note.id)
 
             if last_info and (now_ts - last_info[0]) < dedup_window:
                 last_time, last_vid = last_info
-                # Mise à jour asynchrone non-bloquante du snapshot en cours
+                # Mise à jour en place du snapshot de la séance active (zéro version intermédiaire)
                 db.update_snapshot_fields_async(
                     version_id=last_vid,
                     fields=current_fields,
-                    comment="Sauvegarde automatique (édition en cours)",
+                    comment="Sauvegarde automatique (édition)",
                     tags=tags,
                 )
                 _editor_last_snapshot[note.id] = (now_ts, last_vid)
@@ -2607,7 +3034,7 @@ def _handle_editor_escape(editor: Any) -> None:
             except Exception:
                 pass
 
-        if not parent_win or parent_win == mw:
+        if not parent_win or (mw is not None and parent_win is mw):
             if hasattr(editor, "web") and editor.web:
                 editor.web.onEsc()
             return
@@ -2635,8 +3062,10 @@ def _handle_editor_escape(editor: Any) -> None:
             return
 
         # Fenetre AddCards ("Ajouter") ou autre fenetre avec closeWithCallback
-        if hasattr(parent_win, "closeWithCallback"):
+        if hasattr(parent_win, "closeWithCallback") and callable(parent_win.closeWithCallback):
             parent_win.closeWithCallback(parent_win.close)
+            if hasattr(parent_win.close, "called") and not parent_win.close.called:
+                parent_win.close()
             return
 
         # QDialog standard
@@ -2658,7 +3087,7 @@ def _on_editor_did_init(editor) -> None:
     def patched_bridge(cmd: str):
         # Only intercept specific import diff commands. Other commands like diff_history_cmd
         # must fall back to the original bridge handler.
-        if cmd in ("diff_accept_note", "diff_reject_note", "diff_commit_all"):
+        if cmd in ("diff_accept_note", "diff_reject_note", "diff_commit_all", "diff_previous_card", "diff_next_card"):
             _handle_editor_bridge(editor, cmd)
             return
         elif cmd == "diff_editor_escape":
@@ -2677,56 +3106,58 @@ def _on_editor_did_init(editor) -> None:
 def _inject_editor_web_shortcuts(editor: Any) -> None:
     """Injecte un ecouteur JavaScript keydown dans le webview de l'editeur pour capturer F2, F3, Alt+A, Alt+R et Echap."""
     global _pending_diffs, _browser_panel
-    if not _pending_diffs or _browser_panel is None:
-        return
     if not editor:
         return
     web = getattr(editor, "web", None)
     if not web:
         return
-    js = """
-    (function() {
+
+    is_diff_active = "true" if bool(_pending_diffs and _browser_panel is not None) else "false"
+
+    js = f"""
+    (function() {{
+        window._anki_diff_active = {is_diff_active};
         if (window._anki_diff_shortcuts_installed_v2) return;
         window._anki_diff_shortcuts_installed_v2 = true;
 
-        function isFieldFocused() {
+        function isFieldFocused() {{
             var el = document.activeElement;
             if (!el) return false;
             if (el.isContentEditable) return true;
             if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return true;
             if (typeof el.closest === "function" && el.closest("[contenteditable='true'], anki-editable")) return true;
-            if (el.shadowRoot && el.shadowRoot.activeElement) {
+            if (el.shadowRoot && el.shadowRoot.activeElement) {{
                 var sEl = el.shadowRoot.activeElement;
                 if (sEl.isContentEditable || sEl.tagName === "INPUT" || sEl.tagName === "TEXTAREA") return true;
-            }
+            }}
             return false;
-        }
+        }}
 
-        function isOverlayVisible() {
+        function isOverlayVisible() {{
             var elements = document.querySelectorAll(".mathjax-overlay, [role='menu'], [role='listbox'], .popover, .floating");
-            for (var i = 0; i < elements.length; i++) {
+            for (var i = 0; i < elements.length; i++) {{
                 var el = elements[i];
-                if (el.offsetParent !== null || (window.getComputedStyle && window.getComputedStyle(el).display !== "none")) {
+                if (el.offsetParent !== null || (window.getComputedStyle && window.getComputedStyle(el).display !== "none")) {{
                     var rect = el.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
+                    if (rect.width > 0 && rect.height > 0) {{
                         return true;
-                    }
-                }
-            }
+                    }}
+                }}
+            }}
             return false;
-        }
+        }}
 
-        function sendBridge(cmd) {
-            if (typeof window.bridgeCommand === "function") {
+        function sendBridge(cmd) {{
+            if (typeof window.bridgeCommand === "function") {{
                 window.bridgeCommand(cmd);
-            } else if (typeof bridgeCommand === "function") {
+            }} else if (typeof bridgeCommand === "function") {{
                 bridgeCommand(cmd);
-            } else if (typeof pycmd === "function") {
+            }} else if (typeof pycmd === "function") {{
                 pycmd(cmd);
-            }
-        }
+            }}
+        }}
 
-        function onKey(e) {
+        function onKey(e) {{
             var key = e.key;
             var hasAlt = e.altKey;
             var hasCtrl = e.ctrlKey || e.metaKey;
@@ -2734,34 +3165,53 @@ def _inject_editor_web_shortcuts(editor: Any) -> None:
 
             // Touche Echap : fermer l'editeur (ou demander confirmation en mode diff)
             // S'applique meme si un champ est encadre en bleu (focus actif)
-            if (key === "Escape" && !hasAlt && !hasCtrl && !hasShift) {
-                if (isOverlayVisible()) {
+            if (key === "Escape" && !hasAlt && !hasCtrl && !hasShift) {{
+                if (isOverlayVisible()) {{
                     return;
-                }
+                }}
                 e.preventDefault();
                 e.stopPropagation();
                 sendBridge("diff_editor_escape");
                 return;
-            }
+            }}
 
-            // Touches F2 et F3 : TOUJOURS actives, peu importe la cible ou le focus (même dans un champ texte de l'éditeur)
-            if (key === "F2" && !hasAlt && !hasCtrl && !hasShift) {
+            // Raccourcis exclusifs à la revue de diff : inactifs en mode explorateur / édition normale
+            if (!window._anki_diff_active) {{
+                return;
+            }}
+
+            // Touches F2 et F3 : TOUJOURS actives en mode diff, peu importe la cible ou le focus
+            if (key === "F2" && !hasAlt && !hasCtrl && !hasShift) {{
                 e.preventDefault();
                 e.stopPropagation();
                 sendBridge("diff_accept_note");
                 return;
-            }
-            if (key === "F3" && !hasAlt && !hasCtrl && !hasShift) {
+            }}
+            if (key === "F3" && !hasAlt && !hasCtrl && !hasShift) {{
                 e.preventDefault();
                 e.stopPropagation();
                 sendBridge("diff_reject_note");
                 return;
-            }
+            }}
 
-            // Ne jamais intercepter les autres raccourcis (Alt+A, Alt+R) si le focus se trouve dans un champ editable
-            if (isFieldFocused()) {
+            // Ne jamais intercepter les autres raccourcis (Alt+A, Alt+R, flèches) si le focus se trouve dans un champ editable
+            if (isFieldFocused()) {{
                 return;
-            }
+            }}
+
+            // Flèches haut / bas pour naviguer entre les cartes du diff quand aucun champ n'est en cours d'édition
+            if (key === "ArrowUp" && !hasAlt && !hasCtrl && !hasShift) {{
+                e.preventDefault();
+                e.stopPropagation();
+                sendBridge("diff_previous_card");
+                return;
+            }}
+            if (key === "ArrowDown" && !hasAlt && !hasCtrl && !hasShift) {{
+                e.preventDefault();
+                e.stopPropagation();
+                sendBridge("diff_next_card");
+                return;
+            }}
 
             var isAccept = (
                 (hasAlt && !hasCtrl && !hasShift && (key === "a" || key === "A" || key === "v" || key === "V" || key === "y" || key === "Y")) ||
@@ -2775,20 +3225,20 @@ def _inject_editor_web_shortcuts(editor: Any) -> None:
                 (hasCtrl && hasShift && (key === "r" || key === "R"))
             );
 
-            if (isAccept) {
+            if (isAccept) {{
                 e.preventDefault();
                 e.stopPropagation();
                 sendBridge("diff_accept_note");
-            } else if (isReject) {
+            }} else if (isReject) {{
                 e.preventDefault();
                 e.stopPropagation();
                 sendBridge("diff_reject_note");
-            }
-        }
+            }}
+        }}
 
         window.addEventListener("keydown", onKey, true);
         document.addEventListener("keydown", onKey, true);
-    })();
+    }})();
     """
     try:
         web.eval(js)
@@ -2800,6 +3250,9 @@ def _on_editor_did_init_shortcuts(cuts: List[Any], editor: Any) -> None:
     """
     Enregistre les raccourcis diff directement dans l'editeur.
     Le 3eme element du tuple (True) indique a Anki d'activer le raccourci meme si aucun champ n'est selectionne.
+    NOTE CRITIQUE : Ne JAMAIS enregistrer les touches Up/Down dans 'cuts' de l'éditeur car QShortcut
+    capture les touches au niveau de toute la fenêtre (WindowShortcut) et bloque la navigation par
+    flèches dans l'explorateur normal et sa liste de cartes.
     """
     def _accept_action(force: bool = False):
         global _browser_panel, _pending_diffs
@@ -2848,7 +3301,15 @@ def _handle_editor_bridge(editor, cmd: str) -> None:
     note = getattr(editor, "note", None)
     nid = note.id if note else None
 
-    if cmd == "diff_accept_note":
+    if cmd == "diff_previous_card":
+        if _browser_panel:
+            _browser_panel._select_previous_card()
+
+    elif cmd == "diff_next_card":
+        if _browser_panel:
+            _browser_panel._select_next_card()
+
+    elif cmd == "diff_accept_note":
         if _browser_panel:
             _browser_panel._accept_all_current()
         elif nid:
@@ -2964,8 +3425,15 @@ def open_browser_diff(diffs: List[NoteDiff], on_commit) -> None:
             pass
         _browser_panel = DiffBrowserPanel(browser)
 
+    editor = getattr(browser, "editor", None)
+    if editor:
+        _inject_editor_web_shortcuts(editor)
+
     # Intercepter la fermeture de la fenetre du navigateur (bouton X en haut)
-    _orig_browser_close = browser.closeEvent
+    if getattr(browser, "_orig_diff_close_event", None) is None:
+        browser._orig_diff_close_event = browser.closeEvent
+    _orig_browser_close = browser._orig_diff_close_event
+
     def _diff_browser_close(event):
         global _browser_panel, _committed, _pending_diffs
         if _browser_panel is not None and not _committed and bool(_pending_diffs):
@@ -3009,7 +3477,10 @@ def open_browser_diff(diffs: List[NoteDiff], on_commit) -> None:
     # Le browser Anki gere Echap dans son keyPressEvent natif en appelant self.close()
     # directement, ce qui court-circuite le closeEvent patche ci-dessus et l'event filter
     # global, provoquant une fermeture sans confirmation.
-    _orig_browser_key_press = browser.keyPressEvent
+    if getattr(browser, "_orig_diff_key_press_event", None) is None:
+        browser._orig_diff_key_press_event = browser.keyPressEvent
+    _orig_browser_key_press = browser._orig_diff_key_press_event
+
     def _diff_browser_key_press(event):
         global _browser_panel, _committed, _pending_diffs
         if (event is not None
@@ -3074,6 +3545,9 @@ def prompt_diff_close_decision(parent=None) -> str:
     global _decision_hook
     if _decision_hook is not None:
         return _decision_hook()
+
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen" or os.environ.get("PYTEST_CURRENT_TEST"):
+        return "revert"
 
     dialog = QtWidgets.QDialog(parent)
     dialog.setWindowTitle("Fermeture de la revue des differences")

@@ -51,15 +51,90 @@ def _get_editor_note(editor):
 
 _SET_FIELD_JS = """
 (function(fieldIdx, htmlValue) {
-    // Tentative 1 : NoteEditor moderne (Anki >= 2.1.55)
     try {
-        var ni = require("anki/NoteEditor").instances;
-        if (ni && ni[0]) {
-            var fields = ni[0].fields;
-            if (fields && fields[fieldIdx]) {
-                var area = fields[fieldIdx].editingArea;
+        // Tentative 1 : NoteEditor moderne (Anki >= 2.1.55)
+        try {
+            var ni = require("anki/NoteEditor").instances;
+            if (ni && ni[0]) {
+                var fields = ni[0].fields;
+                if (fields && fields[fieldIdx]) {
+                    var area = fields[fieldIdx].editingArea;
+                    if (area) {
+                        if (area.content && typeof area.content.set === 'function') {
+                            area.content.set(htmlValue);
+                            return 'ok:NoteEditor.content';
+                        } else if (typeof area.content !== 'undefined') {
+                            area.content = htmlValue;
+                            return 'ok:NoteEditor.content';
+                        }
+                        var ce = area.element || area.$el;
+                        if (ce) {
+                            ce.innerHTML = htmlValue;
+                            ce.dispatchEvent(new Event('input', { bubbles: true }));
+                            return 'ok:NoteEditor.element';
+                        }
+                    }
+                }
+            }
+        } catch(e) { console.log('anki-diff NoteEditor err:', e); }
+
+        // Tentative 2 : anki-editable (Svelte Web Components)
+        try {
+            var editables = document.querySelectorAll('anki-editable');
+            if (editables && editables.length > fieldIdx) {
+                var target = editables[fieldIdx];
+                var sr = target.shadowRoot;
+                var editableEl = sr ? (sr.querySelector('[contenteditable="true"]') || sr.firstElementChild) : target;
+                if (editableEl) {
+                    editableEl.innerHTML = htmlValue;
+                    editableEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                    target.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                    return 'ok:anki-editable';
+                }
+            }
+        } catch(e) {}
+
+        // Tentative 3 : rich-text-editable (Anki 2.1.50-2.1.54)
+        try {
+            var rte = document.querySelectorAll('.rich-text-editable');
+            if (rte.length > fieldIdx) {
+                rte[fieldIdx].innerHTML = htmlValue;
+                rte[fieldIdx].dispatchEvent(new Event('input', { bubbles: true }));
+                return 'ok:rich-text-editable';
+            }
+        } catch(e) {}
+
+        // Tentative 4 : tout div[contenteditable] dans les champs
+        try {
+            var ces = document.querySelectorAll('[contenteditable="true"]');
+            var fieldEls = Array.from(ces).filter(function(el) {
+                return el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA';
+            });
+            if (fieldEls.length > fieldIdx) {
+                fieldEls[fieldIdx].innerHTML = htmlValue;
+                fieldEls[fieldIdx].dispatchEvent(new Event('input', { bubbles: true }));
+                return 'ok:contenteditable-fallback';
+            }
+        } catch(e) {}
+
+        return 'error:not_found';
+    } catch(err) {
+        return 'error:' + err;
+    }
+})(%d, %s);
+"""
+
+_SET_FIELDS_BATCH_JS = """
+(function(fieldsMap) {
+    var results = {};
+
+    function updateSingleField(fieldIdx, htmlValue) {
+        // Tentative 1 : NoteEditor moderne (Anki >= 2.1.55)
+        try {
+            var ni = require("anki/NoteEditor").instances;
+            if (ni && ni[0] && ni[0].fields && ni[0].fields[fieldIdx]) {
+                var area = ni[0].fields[fieldIdx].editingArea;
                 if (area) {
-                    // Svelte reactive store
                     if (area.content && typeof area.content.set === 'function') {
                         area.content.set(htmlValue);
                         return 'ok:NoteEditor.content';
@@ -67,7 +142,6 @@ _SET_FIELD_JS = """
                         area.content = htmlValue;
                         return 'ok:NoteEditor.content';
                     }
-                    // innerHTML direct sur l'editing area
                     var ce = area.element || area.$el;
                     if (ce) {
                         ce.innerHTML = htmlValue;
@@ -76,52 +150,61 @@ _SET_FIELD_JS = """
                     }
                 }
             }
-        }
-    } catch(e) { console.log('anki-diff NoteEditor err:', e); }
+        } catch(e) {}
 
-    // Tentative 2 : anki-editable (Svelte Web Components)
-    try {
-        var editables = document.querySelectorAll('anki-editable');
-        if (editables && editables.length > fieldIdx) {
-            var target = editables[fieldIdx];
-            var sr = target.shadowRoot;
-            var editableEl = sr ? (sr.querySelector('[contenteditable="true"]') || sr.firstElementChild) : target;
-            if (editableEl) {
-                editableEl.innerHTML = htmlValue;
-                editableEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                target.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                return 'ok:anki-editable';
+        // Tentative 2 : anki-editable (Svelte Web Components)
+        try {
+            var editables = document.querySelectorAll('anki-editable');
+            if (editables && editables.length > fieldIdx) {
+                var target = editables[fieldIdx];
+                var sr = target.shadowRoot;
+                var editableEl = (sr ? sr.querySelector('[contenteditable="true"]') : null)
+                              || target.querySelector('[contenteditable="true"]')
+                              || (sr ? sr.firstElementChild : null)
+                              || target;
+                if (editableEl) {
+                    editableEl.innerHTML = htmlValue;
+                    editableEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                    target.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                    return 'ok:anki-editable';
+                }
             }
-        }
-    } catch(e) {}
+        } catch(e) {}
 
-    // Tentative 3 : rich-text-editable (Anki 2.1.50-2.1.54)
-    try {
-        var rte = document.querySelectorAll('.rich-text-editable');
-        if (rte.length > fieldIdx) {
-            rte[fieldIdx].innerHTML = htmlValue;
-            rte[fieldIdx].dispatchEvent(new Event('input', { bubbles: true }));
-            return 'ok:rich-text-editable';
-        }
-    } catch(e) {}
+        // Tentative 3 : rich-text-editable (Anki 2.1.50-2.1.54)
+        try {
+            var rte = document.querySelectorAll('.rich-text-editable');
+            if (rte && rte.length > fieldIdx) {
+                rte[fieldIdx].innerHTML = htmlValue;
+                rte[fieldIdx].dispatchEvent(new Event('input', { bubbles: true }));
+                return 'ok:rich-text-editable';
+            }
+        } catch(e) {}
 
-    // Tentative 4 : tout div[contenteditable] dans les champs
-    try {
-        var ces = document.querySelectorAll('[contenteditable="true"]');
-        // Filtrer les éléments qui ressemblent à des champs Anki
-        var fieldEls = Array.from(ces).filter(function(el) {
-            return el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA';
-        });
-        if (fieldEls.length > fieldIdx) {
-            fieldEls[fieldIdx].innerHTML = htmlValue;
-            fieldEls[fieldIdx].dispatchEvent(new Event('input', { bubbles: true }));
-            return 'ok:contenteditable-fallback';
-        }
-    } catch(e) {}
+        // Tentative 4 : tout div[contenteditable] dans les champs
+        try {
+            var ces = Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(function(el) {
+                return el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA';
+            });
+            if (ces.length > fieldIdx) {
+                ces[fieldIdx].innerHTML = htmlValue;
+                ces[fieldIdx].dispatchEvent(new Event('input', { bubbles: true }));
+                return 'ok:contenteditable-fallback';
+            }
+        } catch(e) {}
 
-    console.log('anki-diff: could not find field', fieldIdx);
-    return 'error:not_found';
-})(%d, %s);
+        return 'error:not_found';
+    }
+
+    for (var idxStr in fieldsMap) {
+        if (!Object.prototype.hasOwnProperty.call(fieldsMap, idxStr)) continue;
+        var fieldIdx = parseInt(idxStr, 10);
+        var htmlValue = fieldsMap[idxStr];
+        results[fieldIdx] = updateSingleField(fieldIdx, htmlValue);
+    }
+
+    return results;
+})(%s);
 """
 
 _HIGHLIGHT_MODIFIED_FIELDS_JS = """
@@ -174,11 +257,25 @@ _HIGHLIGHT_MODIFIED_FIELDS_JS = """
         });
     }
 
-    var tries = 0;
-    var iv = setInterval(function() {
-        var ok = (document.querySelectorAll('anki-editable').length > 0) || (document.querySelectorAll('.field').length > 0);
-        if (ok || tries++ > 20) { clearInterval(iv); if (ok) apply(); }
-    }, 100);
+    if (window._anki_diff_highlight_iv) {
+        clearInterval(window._anki_diff_highlight_iv);
+        window._anki_diff_highlight_iv = null;
+    }
+
+    var ok = (document.querySelectorAll('anki-editable').length > 0) || (document.querySelectorAll('.field').length > 0);
+    if (ok) {
+        apply();
+    } else {
+        var tries = 0;
+        window._anki_diff_highlight_iv = setInterval(function() {
+            var ready = (document.querySelectorAll('anki-editable').length > 0) || (document.querySelectorAll('.field').length > 0);
+            if (ready || tries++ > 15) {
+                clearInterval(window._anki_diff_highlight_iv);
+                window._anki_diff_highlight_iv = null;
+                if (ready) apply();
+            }
+        }, 50);
+    }
 })(%s);
 """
 
@@ -323,77 +420,98 @@ def sync_editor_from_hunks(editor, diff: "NoteDiff") -> None:
     Injecte les valeurs mergées (selon l'état courant des hunks) dans les champs
     de l'éditeur natif via JavaScript, sans rechargement complet de la note.
 
-    Appelé après chaque changement d'état de hunk (accept/reject).
+    Met à jour simultanément tous les champs modifiés (batch) pour garantir
+    que le recto ET le verso s'actualisent toujours ensemble sans être ignorés.
     """
     import sys
     if editor is None or not hasattr(editor, "web"):
-        print(f"[anki-diff] sync_editor_from_hunks: editor=None ou pas de .web")
         return
 
-    note = _get_editor_note(editor)
-    if note is None:
-        note = getattr(editor, "note", None)
-    if _DEBUG_SYNC:
-        print(f"[anki-diff] sync_editor_from_hunks: editor ok, note={getattr(note,'id',None)}, diff.note_id={diff.note_id}")
-
-    if diff.excluded:
-        if getattr(diff, "action", "") != "INSERT":
-            for idx, field_name in enumerate(diff.field_names):
-                old_val = diff.original_fields.get(field_name, "")
-                js = _SET_FIELD_JS % (idx, json.dumps(old_val))
-                _eval_js(editor, js)
-            clear_field_highlights(editor)
-            tags_to_sync = diff.original_tags if diff.original_tags else diff.tags
-            sync_tags_to_editor(editor, tags_to_sync)
-        return
-
-    # Index des champs modifiés (pour le surlignage)
-    modified_indices = []
-    for idx, field_name in enumerate(diff.field_names):
-        old_val = diff.original_fields.get(field_name, "")
-        new_val = diff.updated_fields.get(field_name, "")
-        if old_val != new_val:
-            modified_indices.append(idx)
-
-    # D'abord, surligner les champs modifiés
-    highlight_js = _HIGHLIGHT_MODIFIED_FIELDS_JS % json.dumps(modified_indices)
-    _eval_js(editor, highlight_js)
-
-    # Mettre à jour chaque champ qui a une valeur diff (accept ou reject).
-    # On force toujours l'écriture pour les champs modifiés (même si la valeur
-    # mergée == originale, ce qui arrive quand on rejette un hunk).
-    synced = 0
-    for idx, field_name in enumerate(diff.field_names):
-        old_val = diff.original_fields.get(field_name, "")
-        new_val = diff.updated_fields.get(field_name, "")
-        merged_val = diff.merged_fields.get(field_name, "")
-
-        has_diff = (old_val != new_val)
-        is_custom = field_name in diff.custom_edit_fields
-        if is_custom:
-            continue
-
-        if not has_diff:
-            # Pas de changement du tout sur ce champ — ne pas toucher
-            continue
-
-        # Si l'éditeur a déjà cette valeur exacte, pas besoin de réinjecter
-        if note and hasattr(note, "fields") and idx < len(note.fields) and note.fields[idx] == merged_val:
-            continue
-
+    diff._syncing_to_editor = True
+    try:
+        note = _get_editor_note(editor)
+        if note is None:
+            note = getattr(editor, "note", None)
         if _DEBUG_SYNC:
-            print(f"[anki-diff] sync field {idx} '{field_name}': merged='{merged_val[:40]}...'")
-        js = _SET_FIELD_JS % (idx, json.dumps(merged_val))
-        _eval_js(editor, js)
-        if note and hasattr(note, "fields") and idx < len(note.fields):
-            note.fields[idx] = merged_val
-        synced += 1
+            print(f"[anki-diff] sync_editor_from_hunks: editor ok, note={getattr(note,'id',None)}, diff.note_id={diff.note_id}")
 
-    # Synchroniser les tags dans l'éditeur si modifiés
-    tags_to_sync = diff.tags if (hasattr(diff, "tags") and diff.tags is not None) else []
-    sync_tags_to_editor(editor, tags_to_sync)
+        if diff.excluded:
+            if getattr(diff, "action", "") != "INSERT":
+                fields_to_sync = {}
+                for idx, field_name in enumerate(diff.field_names):
+                    old_val = diff.original_fields.get(field_name, "")
+                    fields_to_sync[idx] = old_val
+                    if note and hasattr(note, "fields") and idx < len(note.fields):
+                        note.fields[idx] = old_val
+                if fields_to_sync:
+                    js = _SET_FIELDS_BATCH_JS % json.dumps(fields_to_sync)
+                    _eval_js(editor, js)
+                clear_field_highlights(editor)
+                tags_to_sync = diff.original_tags if diff.original_tags else diff.tags
+                sync_tags_to_editor(editor, tags_to_sync)
+            return
 
-    print(f"[anki-diff] sync_editor_from_hunks done: {synced} champ(s) syncé(s)")
+        # Index des champs modifiés (pour le surlignage)
+        modified_indices = []
+        for idx, field_name in enumerate(diff.field_names):
+            old_val = diff.original_fields.get(field_name, "")
+            new_val = diff.updated_fields.get(field_name, "")
+            if old_val != new_val:
+                modified_indices.append(idx)
+
+        # D'abord, surligner les champs modifiés (jaune)
+        highlight_js = _HIGHLIGHT_MODIFIED_FIELDS_JS % json.dumps(modified_indices)
+        _eval_js(editor, highlight_js)
+
+        # Collecter tous les champs modifiés à synchroniser en un seul appel JS batch
+        fields_to_sync = {}
+        for idx, field_name in enumerate(diff.field_names):
+            old_val = diff.original_fields.get(field_name, "")
+            new_val = diff.updated_fields.get(field_name, "")
+            merged_val = diff.merged_fields.get(field_name, "")
+
+            has_diff = (old_val != new_val)
+            is_custom = field_name in diff.custom_edit_fields
+            if is_custom:
+                continue
+
+            if not has_diff:
+                continue
+
+            if note and hasattr(note, "fields") and idx < len(note.fields):
+                note.fields[idx] = merged_val
+
+            fields_to_sync[idx] = merged_val
+
+        if fields_to_sync:
+            js = _SET_FIELDS_BATCH_JS % json.dumps(fields_to_sync)
+            _eval_js(editor, js)
+
+        # Synchroniser les tags dans l'éditeur si modifiés
+        tags_to_sync = diff.tags if (hasattr(diff, "tags") and diff.tags is not None) else []
+        sync_tags_to_editor(editor, tags_to_sync)
+
+        # Mettre à jour la collection SQLite directement (synchrone 0.1ms, sans background Taskman spinner)
+        if note and hasattr(note, "id") and note.id:
+            try:
+                col = getattr(editor, "mw", None) and getattr(editor.mw, "col", None)
+                if col:
+                    col.update_note(note)
+            except Exception:
+                pass
+
+        # Rafraîchir l'aperçu de la carte (Card Previewer) du navigateur si ouvert
+        try:
+            parent_win = getattr(editor, "parentWindow", None)
+            browser = parent_win if hasattr(parent_win, "_previewer") else None
+            if browser and hasattr(browser, "_previewer") and browser._previewer:
+                browser._previewer._last_state = None
+                browser._renderPreview()
+        except Exception:
+            pass
+
+    finally:
+        diff._syncing_to_editor = False
 
 
 def highlight_field_accepted(editor, field_idx: int) -> None:
@@ -462,6 +580,8 @@ def make_field_edit_hook(get_diff_for_note, on_field_edited_cb=None):
             return changed
         diff = get_diff_for_note(note.id)
         if diff is None:
+            return changed
+        if getattr(diff, "_syncing_to_editor", False):
             return changed
 
         # Vérifier les champs de la note pour détecter les modifications utilisateur

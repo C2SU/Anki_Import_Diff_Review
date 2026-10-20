@@ -66,7 +66,7 @@ class VersionEntry:
     version_id: str
     note_id: int
     timestamp: datetime
-    source: str          # "import_csv", "import_apkg", "manual", "ankicollab", "restore"
+    source: str          # "import_csv", "import_apkg", "manual", "baseline", "backup", "restore", etc.
     comment: str         # Message descriptif libre
     fields: Dict[str, str]
     tags: List[str] = field(default_factory=list)
@@ -78,13 +78,41 @@ class VersionEntry:
     @property
     def source_icon(self) -> str:
         labels = {
-            "import_csv":  "[CSV]",
-            "import_apkg": "[APKG]",
-            "manual":      "[Manuel]",
-            "ankicollab":  "[Collab]",
-            "restore":     "[Restauration]",
+            "baseline":      "[Initial]",
+            "backup":        "[Sauvegarde]",
+            "manual":        "[Manuel]",
+            "import":        "[Import]",
+            "import_csv":    "[CSV]",
+            "import_apkg":   "[APKG]",
+            "import_update": "[Import]",
+            "import_insert": "[Ajout]",
+            "restore":       "[Restauration]",
+            "ankicollab":    "[Collab]",
         }
         return labels.get(self.source, "[Version]")
+
+
+@dataclass
+class FieldDelta:
+    """Différence pour un champ spécifique entre deux versions."""
+    field_name: str
+    old_value: str
+    new_value: str
+    has_changed: bool
+
+
+@dataclass
+class VersionDelta:
+    """Version avec calcul explicite des deltas par rapport à la version précédente."""
+    version: VersionEntry
+    version_number: int  # 1 pour la plus ancienne, incrémenté jusqu'à N
+    previous_version: Optional[VersionEntry]
+    changed_fields: Dict[str, FieldDelta]
+    all_fields: Dict[str, str]
+    tags_changed: bool
+    old_tags: List[str]
+    new_tags: List[str]
+    is_current: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +141,9 @@ class NoteHistoryDB:
         self._write_queue: queue.Queue = queue.Queue()
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
+        self._connections: List[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
+        self._closed = False
         self._init_schema()
 
     @classmethod
@@ -124,9 +155,14 @@ class NoteHistoryDB:
 
     @classmethod
     def reset_instance(cls) -> None:
-        """Force la recréation du singleton (utile après changement de profil)."""
+        """Force la fermeture et recréation du singleton (utile après fermeture ou changement de profil)."""
         with cls._lock:
-            cls._instance = None
+            if cls._instance is not None:
+                try:
+                    cls._instance.close()
+                except Exception as e:
+                    print(f"[anki-diff] Error closing NoteHistoryDB: {e}")
+                cls._instance = None
 
     # ── Connexion thread-safe ────────────────────────────────────────────
 
@@ -141,7 +177,33 @@ class NoteHistoryDB:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA foreign_keys=ON")
             self._local.conn = conn
+            with self._connections_lock:
+                self._connections.append(conn)
         return conn
+
+    def close(self) -> None:
+        """Ferme proprement le worker et toutes les connexions SQLite ouvertes."""
+        self._closed = True
+        try:
+            self.flush(timeout=2.0)
+        except Exception:
+            pass
+        with self._worker_lock:
+            if self._worker_thread and self._worker_thread.is_alive():
+                try:
+                    self._write_queue.put(None)
+                    self._worker_thread.join(timeout=1.5)
+                except Exception:
+                    pass
+                self._worker_thread = None
+        with self._connections_lock:
+            for conn in self._connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._connections.clear()
+        self._local = threading.local()
 
     # ── Background Worker ────────────────────────────────────────────────
 
@@ -206,6 +268,7 @@ class NoteHistoryDB:
         conn.commit()
         try:
             self.cleanup_redundant_duplicates()
+            self.consolidate_intermediate_versions()
         except Exception:
             pass
 
@@ -294,20 +357,21 @@ class NoteHistoryDB:
             if last_json == json_to_store:
                 return
 
-            # B. Coalescing de session : si la dernière version est de type 'manual' et date de moins de 5 minutes,
+            # B. Coalescing de session : si la dernière version est de type 'manual' et date de moins de 15 minutes,
             # et que la nouvelle sauvegarde est également une édition manuelle en cours,
             # on met à jour la version de la session active pour préserver l'historique sans saturation.
-            if source == "manual" and last_src == "manual" and "édition" in comment.lower():
+            # RÈGLE D'OR : une version 'baseline' (état initial pré-session) n'est JAMAIS écrasée !
+            if source == "manual" and last_src == "manual":
                 try:
                     last_dt = datetime.fromisoformat(last_ts_str)
                     elapsed = (datetime.now() - last_dt).total_seconds()
-                    if elapsed < 300:  # 5 minutes
+                    if elapsed < 900:  # 15 minutes
                         now = datetime.now().isoformat()
                         conn.execute(
                             """UPDATE note_versions
                                SET timestamp = ?, comment = ?, fields_json = ?
                                WHERE version_id = ?""",
-                            (now, comment, json_to_store, last_vid),
+                            (now, comment or "Sauvegarde automatique (édition)", json_to_store, last_vid),
                         )
                         conn.commit()
                         return
@@ -434,8 +498,55 @@ class NoteHistoryDB:
         )
         conn.commit()
 
+    def ensure_baseline_snapshot(
+        self,
+        note_id: int,
+        fields: Dict[str, str],
+        tags: Optional[List[str]] = None,
+        mod_time: Optional[float] = None,
+    ) -> Optional[str]:
+        """
+        Garantit que l'état initial d'une note (avant toute modification de la session)
+        est enregistré comme snapshot de référence immuable dans l'historique.
+        Si la dernière version enregistrée est déjà identique, ne fait rien.
+        Retourne le version_id si un snapshot a été créé, None sinon.
+        """
+        stored_fields = dict(fields)
+        stored_fields["__tags__"] = " ".join(tags) if tags else ""
+        json_to_store = json.dumps(stored_fields, ensure_ascii=False)
+        conn = self._conn()
+
+        last_row = conn.execute(
+            """SELECT version_id, fields_json FROM note_versions
+               WHERE note_id = ?
+               ORDER BY timestamp DESC, rowid DESC
+               LIMIT 1""",
+            (note_id,),
+        ).fetchone()
+
+        if last_row and last_row["fields_json"] == json_to_store:
+            return None
+
+        import uuid
+        vid = uuid.uuid4().hex
+        if mod_time:
+            try:
+                ts = datetime.fromtimestamp(mod_time).isoformat()
+            except Exception:
+                ts = datetime.now().isoformat()
+        else:
+            ts = datetime.now().isoformat()
+
+        conn.execute(
+            """INSERT INTO note_versions (version_id, note_id, timestamp, source, comment, fields_json)
+               VALUES (?, ?, ?, 'baseline', 'État initial (avant modification)', ?)""",
+            (vid, note_id, ts, json_to_store),
+        )
+        conn.commit()
+        return vid
+
     def cleanup_redundant_duplicates(self) -> int:
-        """Nettoie les doublons consécutifs identiques accumulés dans la base."""
+        """Nettoie les doublons consécutifs identiques accumulés dans la base pour toutes les sources."""
         conn = self._conn()
         try:
             cursor = conn.cursor()
@@ -448,7 +559,6 @@ class NoteHistoryDB:
                       ON nv1.note_id = nv2.note_id
                      AND nv1.fields_json = nv2.fields_json
                      AND nv1.timestamp > nv2.timestamp
-                     AND nv1.source = 'manual'
                      AND NOT EXISTS (
                          SELECT 1 FROM note_versions mid
                          WHERE mid.note_id = nv1.note_id
@@ -464,6 +574,255 @@ class NoteHistoryDB:
         except Exception as e:
             print(f"[anki-diff] Error in cleanup_redundant_duplicates: {e}")
             return 0
+
+    def consolidate_intermediate_versions(self, note_id: Optional[int] = None) -> int:
+        """
+        Consolide les rafales de versions intermédiaires générées lors de la frappe
+        au clavier (modifications manuelles successives espacées de moins de 3 minutes).
+        Conserve uniquement la première version du cluster (état initial de la frappe)
+        et la dernière version (état final stabilisé).
+        """
+        conn = self._conn()
+        query = "SELECT rowid, version_id, note_id, timestamp, source, fields_json FROM note_versions"
+        if note_id:
+            query += f" WHERE note_id = {int(note_id)}"
+        query += " ORDER BY note_id, timestamp ASC, rowid ASC"
+
+        rows = conn.execute(query).fetchall()
+        from collections import defaultdict
+        by_note = defaultdict(list)
+        for r in rows:
+            by_note[r["note_id"]].append(r)
+
+        to_delete = []
+        for nid, note_rows in by_note.items():
+            if len(note_rows) < 3:
+                continue
+            cluster = []
+            for r in note_rows:
+                try:
+                    ts = datetime.fromisoformat(r["timestamp"])
+                except Exception:
+                    continue
+                src = r["source"]
+                if not cluster:
+                    cluster.append((r, ts))
+                    continue
+                prev_r, prev_ts = cluster[-1]
+                gap = (ts - prev_ts).total_seconds()
+                if gap < 180 and src == "manual" and prev_r["source"] == "manual":
+                    cluster.append((r, ts))
+                else:
+                    if len(cluster) > 2:
+                        for mid_r, _ in cluster[1:-1]:
+                            to_delete.append(mid_r["rowid"])
+                    cluster = [(r, ts)]
+            if len(cluster) > 2:
+                for mid_r, _ in cluster[1:-1]:
+                    to_delete.append(mid_r["rowid"])
+
+        if to_delete:
+            conn.executemany("DELETE FROM note_versions WHERE rowid = ?", [(rid,) for rid in to_delete])
+            conn.commit()
+        return len(to_delete)
+
+    def scan_backups_for_note(
+        self,
+        note_id: int,
+        progress_callback: Optional[Callable[[int, int, int], None]] = None,
+    ) -> List[VersionEntry]:
+        """
+        Explore les sauvegardes automatiques (.colpkg) d'Anki pour extraire
+        toutes les versions antérieures distinctes de la note.
+        Insère les versions trouvées dans note_versions avec source='backup'.
+        Retourne la liste complète à jour de toutes les versions de la note.
+        """
+        mw = _get_mw()
+        backup_folder = None
+        if mw and hasattr(mw, "pm") and mw.pm and hasattr(mw.pm, "backupFolder"):
+            try:
+                backup_folder = mw.pm.backupFolder()
+            except Exception:
+                pass
+        if not backup_folder or not os.path.isdir(backup_folder):
+            db_dir = os.path.dirname(self._path)
+            cand = os.path.join(db_dir, "backups")
+            if os.path.isdir(cand):
+                backup_folder = cand
+
+        if not backup_folder or not os.path.isdir(backup_folder):
+            return self.get_history(note_id)
+
+        import glob
+        backups = sorted(glob.glob(os.path.join(backup_folder, "*.colpkg")), reverse=True)
+        if not backups:
+            return self.get_history(note_id)
+
+        try:
+            import anki._backend
+            backend = anki._backend.RustBackend()
+        except Exception:
+            return self.get_history(note_id)
+
+        import tempfile
+        import shutil
+
+        # Récupérer les empreintes déjà connues en base
+        conn = self._conn()
+        existing_jsons = set(
+            r["fields_json"] for r in conn.execute(
+                "SELECT fields_json FROM note_versions WHERE note_id = ?", (note_id,)
+            ).fetchall()
+        )
+
+        tmp_dir = tempfile.mkdtemp(prefix="anki_diff_backup_scan_")
+        found_count = 0
+        total = len(backups)
+
+        try:
+            media_dir = os.path.join(tmp_dir, "media")
+            media_db = os.path.join(tmp_dir, "media.db")
+            os.makedirs(media_dir, exist_ok=True)
+            col_path = os.path.join(tmp_dir, "temp_col.anki2")
+
+            last_seen_mod = None
+
+            for idx, bp in enumerate(backups):
+                if progress_callback:
+                    try:
+                        progress_callback(idx + 1, total, found_count)
+                    except Exception:
+                        pass
+
+                try:
+                    backend.import_collection_package(
+                        col_path=col_path,
+                        backup_path=bp,
+                        media_folder=media_dir,
+                        media_db=media_db,
+                    )
+                    bconn = sqlite3.connect(col_path)
+                    brow = bconn.execute(
+                        "SELECT mid, mod, flds, tags FROM notes WHERE id = ?", (note_id,)
+                    ).fetchone()
+
+                    if brow:
+                        b_mid, b_mod, b_flds_str, b_tags_str = brow
+                        if b_mod != last_seen_mod:
+                            last_seen_mod = b_mod
+
+                            # Récupérer les noms de champs
+                            fld_names = [
+                                r[0] for r in bconn.execute(
+                                    "SELECT name FROM fields WHERE ntid = ? ORDER BY ord ASC", (b_mid,)
+                                ).fetchall()
+                            ]
+                            vals = b_flds_str.split("\x1f")
+                            if fld_names and len(vals) <= len(fld_names):
+                                fld_dict = dict(zip(fld_names, vals))
+                            else:
+                                fld_dict = {fld_names[i] if i < len(fld_names) else f"Field_{i}": vals[i] for i in range(len(vals))}
+
+                            b_tags = [t for t in b_tags_str.strip().split(" ") if t]
+                            fld_dict["__tags__"] = " ".join(b_tags)
+                            fj = json.dumps(fld_dict, ensure_ascii=False)
+
+                            if fj not in existing_jsons:
+                                existing_jsons.add(fj)
+                                import uuid
+                                vid = uuid.uuid4().hex
+                                dt = datetime.fromtimestamp(b_mod)
+                                b_comment = f"Sauvegarde Anki du {dt.strftime('%d/%m/%Y %H:%M')}"
+                                conn.execute(
+                                    """INSERT INTO note_versions (version_id, note_id, timestamp, source, comment, fields_json)
+                                       VALUES (?, ?, ?, 'backup', ?, ?)""",
+                                    (vid, note_id, dt.isoformat(), b_comment, fj),
+                                )
+                                conn.commit()
+                                found_count += 1
+                    bconn.close()
+                except Exception:
+                    continue
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return self.get_history(note_id)
+
+    def get_history_with_deltas(
+        self,
+        note_id: int,
+        current_fields: Optional[Dict[str, str]] = None,
+        current_tags: Optional[List[str]] = None,
+    ) -> List[VersionDelta]:
+        """
+        Retourne l'historique de la note enrichi avec le calcul des différences
+        champ par champ (Previous vs Updated) pour chaque version.
+        La liste est ordonnée de la plus récente à la plus ancienne.
+        """
+        raw_history = self.get_history(note_id)
+        chronological = list(reversed(raw_history))
+
+        deltas_chronological: List[VersionDelta] = []
+        prev_entry: Optional[VersionEntry] = None
+
+        for idx, entry in enumerate(chronological):
+            v_num = idx + 1
+            fields = dict(entry.fields)
+            tags = list(entry.tags)
+
+            changed_fields: Dict[str, FieldDelta] = {}
+            if prev_entry is None:
+                for fname, val in fields.items():
+                    if val:
+                        changed_fields[fname] = FieldDelta(
+                            field_name=fname,
+                            old_value="",
+                            new_value=val,
+                            has_changed=True,
+                        )
+                tags_changed = bool(tags)
+                old_tags: List[str] = []
+            else:
+                prev_fields = prev_entry.fields
+                all_keys = set(fields.keys()) | set(prev_fields.keys())
+                for fname in all_keys:
+                    old_v = prev_fields.get(fname, "")
+                    new_v = fields.get(fname, "")
+                    if old_v != new_v:
+                        changed_fields[fname] = FieldDelta(
+                            field_name=fname,
+                            old_value=old_v,
+                            new_value=new_v,
+                            has_changed=True,
+                        )
+                old_tags = list(prev_entry.tags)
+                tags_changed = sorted(old_tags) != sorted(tags)
+
+            delta = VersionDelta(
+                version=entry,
+                version_number=v_num,
+                previous_version=prev_entry,
+                changed_fields=changed_fields,
+                all_fields=fields,
+                tags_changed=tags_changed,
+                old_tags=old_tags,
+                new_tags=tags,
+                is_current=False,
+            )
+            deltas_chronological.append(delta)
+            prev_entry = entry
+
+        res = list(reversed(deltas_chronological))
+
+        if res and current_fields:
+            clean_curr = {k: v for k, v in current_fields.items() if k != "__tags__"}
+            for d in res:
+                clean_ver = {k: v for k, v in d.all_fields.items() if k != "__tags__"}
+                if clean_ver == clean_curr:
+                    d.is_current = True
+                    break
+
+        return res
 
     def delete_note_history(self, note_id: int) -> None:
         """Supprime tout l'historique d'une note."""
@@ -506,8 +865,23 @@ class ProtectedFieldsDB:
     peut déverrouiller depuis le diff panel.
     """
 
+    _instance: Optional["ProtectedFieldsDB"] = None
+    _lock = threading.Lock()
+
     def __init__(self, db: Optional[NoteHistoryDB] = None):
         self._db = db or NoteHistoryDB.instance()
+
+    @classmethod
+    def instance(cls) -> "ProtectedFieldsDB":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        with cls._lock:
+            cls._instance = None
 
     def protect_field(self, note_id: int, field_name: str, locked_value: str) -> None:
         """Protège un champ avec la valeur actuelle (ou récupérée)."""
