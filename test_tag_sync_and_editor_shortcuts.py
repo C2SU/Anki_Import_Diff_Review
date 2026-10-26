@@ -881,7 +881,467 @@ def test_arrow_navigation_when_focus_on_diff_panel_widgets(qtbot):
         bi._browser_panel = None
 
 
+def test_accept_tags_only_preserves_field_choices(qtbot):
+    """Vérifie que accept_tags_only met à jour les tags sans impacter les choix de champs."""
+    diff = NoteDiff(
+        note_id=901,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front", "Back"],
+        original_fields={"Front": "Q_old", "Back": "A_old"},
+        updated_fields={"Front": "Q_new", "Back": "A_new"},
+        tags=["tag_old"],
+        original_tags=["tag_old"],
+        updated_tags=["tag_old", "tag_imported", "cardio"],
+    )
+    # Simuler un choix personnalisé dans les champs : Front rejeté (Q_old), Back accepté (A_new)
+    diff.merged_fields = {"Front": "Q_old", "Back": "A_new"}
+    diff.tags_active_target = "OLD"
+
+    bi.set_pending_diffs([diff], lambda x: None)
+
+    class FakeBrowser(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.table = QtWidgets.QTableView(self)
+            self.editor = None
+
+    browser = FakeBrowser()
+    qtbot.addWidget(browser)
+    browser.show()
+
+    try:
+        panel = DiffBrowserPanel(browser)
+        bi._browser_panel = panel
+        note_panel = panel._note_panels[901]
+
+        # Modifier l'état d'un hunk de Front pour simuler un rejet explicite
+        front_fp = note_panel._field_panels["Front"]
+        for h in front_fp.hunks:
+            h.accepted = False
+        front_fp.active_target = "OLD"
+
+        # Actionner accept_tags_only
+        note_panel.accept_tags_only()
+
+        # 1. Tags doivent être passés à updated_tags
+        assert diff.tags == ["tag_old", "tag_imported", "cardio"]
+        assert diff.tags_active_target == "PROP"
+
+        # 2. Les choix faits dans les champs NE DOIVENT PAS avoir été impactés
+        assert diff.merged_fields["Front"] == "Q_old"
+        assert diff.merged_fields["Back"] == "A_new"
+        assert front_fp.active_target == "OLD"
+        assert all(h.accepted is False for h in front_fp.hunks)
+
+    finally:
+        bi.clear_pending_diffs()
+        bi._browser_panel = None
 
 
+def test_browser_context_menu_accept_tags_only_single_and_multi(qtbot):
+    """Vérifie l'option au clic droit du browser (simple et multi-sélection) pour accepter uniquement les tags."""
+    diff1 = NoteDiff(
+        note_id=910,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front"],
+        original_fields={"Front": "Old1"},
+        updated_fields={"Front": "New1"},
+        tags=["t1"],
+        original_tags=["t1"],
+        updated_tags=["t1", "t1_new"],
+    )
+    diff1.merged_fields = {"Front": "Old1"}  # Choix champ gardé
 
+    diff2 = NoteDiff(
+        note_id=911,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front"],
+        original_fields={"Front": "Old2"},
+        updated_fields={"Front": "New2"},
+        tags=["t2"],
+        original_tags=["t2"],
+        updated_tags=["t2", "t2_new"],
+    )
+    diff2.merged_fields = {"Front": "Old2"}  # Choix champ gardé
+
+    bi.set_pending_diffs([diff1, diff2], lambda x: None)
+
+    class FakeBrowser(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.table = QtWidgets.QTableView(self)
+            self.editor = None
+            self._selected = []
+
+        def selected_notes(self):
+            return self._selected
+
+    browser = FakeBrowser()
+    qtbot.addWidget(browser)
+    browser.show()
+
+    try:
+        panel = DiffBrowserPanel(browser)
+        bi._browser_panel = panel
+
+        # 1. Test clic droit avec 1 seule note sélectionnée
+        browser._selected = [910]
+        menu1 = QtWidgets.QMenu(browser)
+        bi._on_browser_will_show_context_menu(browser, menu1)
+
+        actions1 = [a.text() for a in menu1.actions()]
+        assert "Diff : Accepter les modifications" in actions1
+        assert "Diff : Garder l'ancien (rejeter)" in actions1
+        assert "Diff : Accepter uniquement les tags" in actions1
+
+        # Déclencher l'action Accepter uniquement les tags
+        act_tags1 = next(a for a in menu1.actions() if a.text() == "Diff : Accepter uniquement les tags")
+        act_tags1.trigger()
+
+        assert diff1.tags == ["t1", "t1_new"]
+        assert diff1.tags_active_target == "PROP"
+        assert diff1.merged_fields["Front"] == "Old1"  # Champs non impactés
+
+        # diff2 ne doit pas avoir changé
+        assert diff2.tags == ["t2"]
+
+        # 2. Test clic droit avec sélection multiple (2 notes)
+        browser._selected = [910, 911]
+        menu2 = QtWidgets.QMenu(browser)
+        bi._on_browser_will_show_context_menu(browser, menu2)
+
+        actions2 = [a.text() for a in menu2.actions()]
+        assert "Diff : Accepter uniquement les tags (2 notes)" in actions2
+
+        act_tags2 = next(a for a in menu2.actions() if "Accepter uniquement les tags" in a.text())
+        act_tags2.trigger()
+
+        assert diff2.tags == ["t2", "t2_new"]
+        assert diff2.tags_active_target == "PROP"
+        assert diff2.merged_fields["Front"] == "Old2"  # Champs non impactés
+
+    finally:
+        bi.clear_pending_diffs()
+        bi._browser_panel = None
+
+
+def test_editor_context_menu_and_bridge_accept_tags_only(qtbot):
+    """Vérifie le menu contextuel de l'éditeur et le bridge JS diff_accept_tags_only."""
+    note = MockNote(920, ["Front"], ["old_tag"])
+    editor = MockEditor(note)
+
+    diff = NoteDiff(
+        note_id=920,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front"],
+        original_fields={"Front": "FieldOld"},
+        updated_fields={"Front": "FieldNew"},
+        tags=["old_tag"],
+        original_tags=["old_tag"],
+        updated_tags=["old_tag", "tag_from_import"],
+    )
+    diff.merged_fields = {"Front": "FieldOld"}
+
+    bi.set_pending_diffs([diff], lambda x: None)
+
+    class FakeBrowser(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.table = QtWidgets.QTableView(self)
+            self.editor = editor
+
+        def selected_notes(self):
+            return [920]
+
+    browser = FakeBrowser()
+    qtbot.addWidget(browser)
+    browser.show()
+
+    try:
+        panel = DiffBrowserPanel(browser)
+        bi._browser_panel = panel
+
+        class FakeWebview(QtWidgets.QWidget):
+            def __init__(self, ed):
+                super().__init__()
+                self.editor = ed
+
+        webview = FakeWebview(editor)
+        menu = QtWidgets.QMenu(browser)
+
+        # 1. Vérifier la présence de l'action dans le menu contextuel de l'éditeur
+        bi._on_editor_will_show_context_menu(webview, menu)
+        action_texts = [a.text() for a in menu.actions()]
+        assert "Accepter uniquement les tags de cette note" in action_texts
+
+        # 2. Déclencher via le bridge diff_accept_tags_only
+        bi._handle_editor_bridge(editor, "diff_accept_tags_only")
+
+        assert diff.tags == ["old_tag", "tag_from_import"]
+        assert diff.tags_active_target == "PROP"
+        assert diff.merged_fields["Front"] == "FieldOld"  # Champ inchangé
+        # Synchronisation dans l'éditeur
+        assert note.tags == ["old_tag", "tag_from_import"]
+        assert editor.tags.text() == "old_tag tag_from_import"
+
+    finally:
+        bi.clear_pending_diffs()
+        bi._browser_panel = None
+
+
+def test_shortcuts_f4_and_alt_shift_t(qtbot):
+    """Vérifie que les raccourcis F4 et Alt+Shift+T déclenchent accept_tags_only."""
+    diff = NoteDiff(
+        note_id=930,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front"],
+        original_fields={"Front": "FrontOld"},
+        updated_fields={"Front": "FrontNew"},
+        tags=["old_tag"],
+        original_tags=["old_tag"],
+        updated_tags=["old_tag", "new_tag"],
+    )
+    diff.merged_fields = {"Front": "FrontOld"}
+
+    bi.set_pending_diffs([diff], lambda x: None)
+
+    class FakeBrowser(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.table = QtWidgets.QTableView(self)
+            self.editor = None
+
+        def selected_notes(self):
+            return [930]
+
+    browser = FakeBrowser()
+    qtbot.addWidget(browser)
+    browser.show()
+
+    try:
+        panel = DiffBrowserPanel(browser)
+        bi._browser_panel = panel
+        note_panel = panel._note_panels[930]
+
+        # 1. Test touche F4
+        diff.tags = ["old_tag"]
+        diff.tags_active_target = "OLD"
+
+        ev_f4 = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, QtCore.Qt.Key.Key_F4, QtCore.Qt.KeyboardModifier.NoModifier)
+        handled_f4 = panel._event_filter.eventFilter(browser, ev_f4)
+        assert handled_f4 is True, "F4 doit être intercepté par DiffGlobalEventFilter"
+        assert diff.tags == ["old_tag", "new_tag"]
+        assert diff.tags_active_target == "PROP"
+        assert diff.merged_fields["Front"] == "FrontOld"
+
+        # 2. Test touche Alt+Shift+T
+        diff.tags = ["old_tag"]
+        diff.tags_active_target = "OLD"
+
+        ev_alt_shift_t = QtGui.QKeyEvent(
+            QtCore.QEvent.Type.KeyPress,
+            QtCore.Qt.Key.Key_T,
+            QtCore.Qt.KeyboardModifier.AltModifier | QtCore.Qt.KeyboardModifier.ShiftModifier
+        )
+        handled_ast = panel._event_filter.eventFilter(browser, ev_alt_shift_t)
+        assert handled_ast is True, "Alt+Shift+T doit être intercepté par DiffGlobalEventFilter"
+        assert diff.tags == ["old_tag", "new_tag"]
+        assert diff.tags_active_target == "PROP"
+        assert diff.merged_fields["Front"] == "FrontOld"
+
+    finally:
+        bi.clear_pending_diffs()
+        bi._browser_panel = None
+
+
+def test_tags_display_browser_adaptation_with_many_tags(qtbot):
+    """Vérifie que _TagsDisplayBrowser et TagsDiffPanel adaptent leur hauteur dynamiquement
+    et affichent l'intégralité des tags sans troncation pour les cartes contenant 50+ tags."""
+    from src.ui import _TagsDisplayBrowser, TagsDiffPanel
+
+    many_tags = [f"Item_{i:02d}_specialite_medicale_longue_denomination" for i in range(50)]
+    diff = NoteDiff(
+        note_id=999,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front"],
+        original_fields={"Front": "A"},
+        updated_fields={"Front": "B"},
+        tags=many_tags,
+        original_tags=many_tags[:25],
+        updated_tags=many_tags,
+    )
+
+    panel = TagsDiffPanel(diff)
+    qtbot.addWidget(panel)
+    panel.resize(180, 400)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    display = panel._tags_display
+    assert isinstance(display, _TagsDisplayBrowser)
+    html_text = display.text()
+
+    # Tous les 50 tags doivent être présents dans le contenu HTML text()
+    for tag in many_tags:
+        assert tag in html_text
+
+    # La hauteur calculée doit dépasser largement la hauteur d'une ligne simple (qui fait ~24px)
+    assert display.height() > 200
+    assert display.document().size().height() > 200
+
+    # Test API text() et setText()
+    display.setText("<span>simple_tag</span>")
+    assert "simple_tag" in display.text()
+
+
+def test_escape_key_preserves_child_dialogs_such_as_linked_cards(qtbot):
+    """Vérifie qu'appuyer sur Échap lorsqu'un dialogue enfant (comme LinkedCardsDialog)
+    est actif ne déclenche JAMAIS la pop-up de fermeture du diff ni le panneau diff."""
+    from unittest.mock import MagicMock
+
+    diff = NoteDiff(
+        note_id=940,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front"],
+        original_fields={"Front": "F1"},
+        updated_fields={"Front": "F2"},
+    )
+    bi.set_pending_diffs([diff], lambda x: None)
+
+    class FakeBrowser(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.table = QtWidgets.QTableView(self)
+            self.editor = None
+
+        def selected_notes(self):
+            return [940]
+
+    browser = FakeBrowser()
+    qtbot.addWidget(browser)
+    browser.show()
+
+    # Dialogue simulant LinkedCardsDialog (non-modal, hérite de QDialog, possède reject())
+    class LinkedCardsDialog(QtWidgets.QDialog):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.rejected_called = False
+
+        def reject(self):
+            self.rejected_called = True
+            super().reject()
+
+    dialog = LinkedCardsDialog(browser)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    QtWidgets.QApplication.setActiveWindow(dialog)
+
+    try:
+        panel = DiffBrowserPanel(browser)
+        bi._browser_panel = panel
+        panel._on_request_close_panel = MagicMock()
+
+        # 1. Vérifier _should_handle_escape
+        assert panel._event_filter._should_handle_escape(panel, browser, dialog) is False
+
+        # 2. KeyPress Échap envoyé sur le dialogue enfant
+        ev_esc = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, QtCore.Qt.Key.Key_Escape, QtCore.Qt.KeyboardModifier.NoModifier)
+        handled = panel._event_filter.eventFilter(dialog, ev_esc)
+
+        # L'event filter ne doit pas intercepter l'événement
+        assert handled is False
+        assert panel._on_request_close_panel.call_count == 0
+
+        # 3. ShortcutOverride sur le dialogue enfant
+        ev_override = QtGui.QKeyEvent(QtCore.QEvent.Type.ShortcutOverride, QtCore.Qt.Key.Key_Escape, QtCore.Qt.KeyboardModifier.NoModifier)
+        handled_ov = panel._event_filter.eventFilter(dialog, ev_override)
+        assert handled_ov is False
+        assert panel._on_request_close_panel.call_count == 0
+
+    finally:
+        bi.clear_pending_diffs()
+        bi._browser_panel = None
+        dialog.close()
+
+
+def test_escape_key_on_browser_triggers_close_panel_once(qtbot):
+    """Vérifie qu'Échap sur l'explorateur déclenche _on_request_close_panel exactement une fois,
+    sans double déclenchement lors de la séquence ShortcutOverride -> KeyPress."""
+    from unittest.mock import MagicMock
+
+    diff = NoteDiff(
+        note_id=941,
+        action="UPDATE",
+        model_name="Basic",
+        field_names=["Front"],
+        original_fields={"Front": "F1"},
+        updated_fields={"Front": "F2"},
+    )
+    bi.set_pending_diffs([diff], lambda x: None)
+
+    class FakeBrowser(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.table = QtWidgets.QTableView(self)
+            self.editor = None
+
+        def selected_notes(self):
+            return [941]
+
+    browser = FakeBrowser()
+    qtbot.addWidget(browser)
+    browser.show()
+    QtWidgets.QApplication.setActiveWindow(browser)
+
+    try:
+        panel = DiffBrowserPanel(browser)
+        bi._browser_panel = panel
+        panel._on_request_close_panel = MagicMock()
+
+        # 1. ShortcutOverride Échap : doit être accepté mais NE PAS appeler _on_request_close_panel
+        ev_override = QtGui.QKeyEvent(QtCore.QEvent.Type.ShortcutOverride, QtCore.Qt.Key.Key_Escape, QtCore.Qt.KeyboardModifier.NoModifier)
+        handled_ov = panel._event_filter.eventFilter(browser, ev_override)
+        assert handled_ov is True
+        assert panel._on_request_close_panel.call_count == 0
+
+        # 2. KeyPress Échap consécutif : doit déclencher _on_request_close_panel une seule fois
+        ev_press = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, QtCore.Qt.Key.Key_Escape, QtCore.Qt.KeyboardModifier.NoModifier)
+        handled_pr = panel._event_filter.eventFilter(browser, ev_press)
+        assert handled_pr is True
+        assert panel._on_request_close_panel.call_count == 1
+
+    finally:
+        bi.clear_pending_diffs()
+        bi._browser_panel = None
+
+
+def test_prompt_diff_close_decision_anti_reentrancy():
+    """Vérifie que prompt_diff_close_decision empêche tout double déclenchement via son verrou
+    anti-réentrance et son debounce temporel."""
+    import time
+    from unittest.mock import patch
+
+    # Réinitialiser les états
+    bi._is_prompting_decision = False
+    bi._last_prompt_decision_time = 0.0
+
+    # Simuler un premier appel en cours
+    bi._is_prompting_decision = True
+    with patch.dict("os.environ", {"PYTEST_CURRENT_TEST": "", "QT_QPA_PLATFORM": ""}):
+        res1 = bi.prompt_diff_close_decision()
+        assert res1 == "cancel"
+
+    # Simuler un appel immédiatement après fermeture (< 0.6s)
+    bi._is_prompting_decision = False
+    bi._last_prompt_decision_time = time.monotonic()
+    with patch.dict("os.environ", {"PYTEST_CURRENT_TEST": "", "QT_QPA_PLATFORM": ""}):
+        res2 = bi.prompt_diff_close_decision()
+        assert res2 == "cancel"
 

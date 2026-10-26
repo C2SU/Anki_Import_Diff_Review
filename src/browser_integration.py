@@ -258,7 +258,7 @@ QDockWidget, QTabWidget, QStackedWidget, QScrollArea, NoteDiffPanelWithSync {{
 }}
 QWidget {{
     color: {c['text_primary']};
-    font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-size: 13px;
 }}
 QDockWidget {{
@@ -661,6 +661,53 @@ class DiffGlobalEventFilter(QtCore.QObject):
         self._last_override_key = None
         self._last_override_time = 0.0
 
+    def _should_handle_escape(self, panel, browser, obj) -> bool:
+        """
+        Vérifie si la touche Échap risque réellement de fermer l'explorateur / la revue de diff.
+        Ne doit JAMAIS intercepter Échap si :
+        - Un dialogue enfant (modal ou non modal, ex: LinkedCardsDialog) est actif
+        - Un popup / menu / completer / preview est affiché
+        - Le focus se trouve dans un widget secondaire ayant son propre cycle de fermeture
+        """
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            return False
+
+        # 1. Popups Qt actifs (menus déroulants, QCompleter, tooltips interactifs)
+        if app.activePopupWidget() is not None:
+            return False
+
+        active_win = app.activeWindow()
+        # 2. Si la fenêtre active est une QDialog (ex: dialogue de Lier les cartes, styles, etc.)
+        #    même non-modale (comme LinkedCardsDialog), laisser le dialogue se fermer normalement
+        if active_win is not None and active_win is not browser and active_win is not panel.window():
+            if isinstance(active_win, QtWidgets.QDialog) or hasattr(active_win, "reject"):
+                return False
+            cls_name = active_win.__class__.__name__
+            if "Dialog" in cls_name or cls_name in (
+                "LinkedCardsDialog", "MirrorSelectionDialog", "InterLinkSelectionDialog",
+                "CrossLinksSelectionDialog", "CardStylesDialog", "EDNSettingsDialog", "ShortcutsDialog"
+            ):
+                return False
+
+        # 3. Vérifier également l'objet recevant l'événement
+        if isinstance(obj, QtWidgets.QWidget):
+            w = obj.window()
+            if w is not None and w is not browser and w is not panel.window():
+                if isinstance(w, QtWidgets.QDialog) or hasattr(w, "reject"):
+                    return False
+                cls_name = w.__class__.__name__
+                if "Dialog" in cls_name:
+                    return False
+
+            # Popup d'aperçu d'assistant de Lier les cartes (EdnAssistantPreviewPopup)
+            if obj.objectName() == "EdnAssistantPreviewPopup" or "PreviewPopup" in obj.metaObject().className():
+                return False
+            if hasattr(obj, "_edn_parent_widget") or getattr(obj, "_is_edn_preview", False):
+                return False
+
+        return True
+
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
         ev_type = event.type()
         if ev_type not in (QtCore.QEvent.Type.ShortcutOverride, QtCore.QEvent.Type.KeyPress):
@@ -757,9 +804,15 @@ class DiffGlobalEventFilter(QtCore.QObject):
         # Touches F2 et F3 directes (sans modificateurs)
         is_f2 = (key == QtCore.Qt.Key.Key_F2 and not (has_alt or has_ctrl or has_shift))
         is_f3 = (key == QtCore.Qt.Key.Key_F3 and not (has_alt or has_ctrl or has_shift))
+        is_f4 = (key == QtCore.Qt.Key.Key_F4 and not (has_alt or has_ctrl or has_shift))
 
         # Raccourci Echap : fermer la revue de diff avec confirmation
-        is_escape = (key == QtCore.Qt.Key.Key_Escape and not (has_alt or has_ctrl or has_shift))
+        # STRICTEMENT si la page d'explorateur risque d'être réellement fermée,
+        # et JAMAIS si un dialogue (modal ou non modal, ex: LinkedCardsDialog),
+        # un menu contextuel, un popup d'aperçu ou une sous-fenêtre est actif.
+        is_escape = False
+        if key == QtCore.Qt.Key.Key_Escape and not (has_alt or has_ctrl or has_shift):
+            is_escape = self._should_handle_escape(panel, browser, obj)
 
         # Flèches de déplacement vers le haut / le bas (sans modificateurs)
         is_up = (key == QtCore.Qt.Key.Key_Up and not (has_alt or has_ctrl or has_shift))
@@ -781,6 +834,13 @@ class DiffGlobalEventFilter(QtCore.QObject):
             or (has_ctrl and has_shift and not has_alt and key == QtCore.Qt.Key.Key_R)
         )
 
+        # Raccourcis Accepter uniquement les tags : F4, Alt+Shift+T, Ctrl+Alt+Shift+T
+        is_accept_tags = (
+            is_f4
+            or (has_alt and has_shift and not has_ctrl and key == QtCore.Qt.Key.Key_T)
+            or (has_ctrl and has_alt and has_shift and key == QtCore.Qt.Key.Key_T)
+        )
+
         # Raccourcis Historique : Alt+H, Ctrl+Shift+H
         is_history = (
             (has_alt and not has_ctrl and not has_shift and key == QtCore.Qt.Key.Key_H)
@@ -798,14 +858,14 @@ class DiffGlobalEventFilter(QtCore.QObject):
             has_ctrl and has_alt and not has_shift and key == QtCore.Qt.Key.Key_C
         )
 
-        if not (is_accept or is_reject or is_history or is_copy or is_copy_nid or is_escape or is_up or is_down):
+        if not (is_accept or is_reject or is_accept_tags or is_history or is_copy or is_copy_nid or is_escape or is_up or is_down):
             return False
 
-        # F2, F3 et Escape sont des touches fonctionnelles dédiées : elles doivent TOUJOURS fonctionner
+        # F2, F3, F4 et Escape sont des touches fonctionnelles dédiées : elles doivent TOUJOURS fonctionner
         # peu importe la cible ou le focus de l'utilisateur (parcourir, éditeur, champ texte, menu latéral liens, menu latéral diff...).
         # Seuls les raccourcis textuels basés sur des lettres (Alt+A, Alt+R, Alt+C, etc.) ainsi que les flèches haut/bas
         # sont ignorés quand l'utilisateur est dans un champ de saisie texte (pour permettre l'édition et la navigation dans le texte).
-        if not (is_f2 or is_f3 or is_escape):
+        if not (is_f2 or is_f3 or is_f4 or is_escape):
             if _is_inside_field(panel, obj):
                 return False
 
@@ -840,6 +900,8 @@ class DiffGlobalEventFilter(QtCore.QObject):
                 panel._accept_all_current()
             elif is_reject:
                 panel._reject_all_current()
+            elif is_accept_tags:
+                panel._accept_tags_only_current()
             elif is_history:
                 panel._toggle_history_tab()
             elif is_copy:
@@ -847,7 +909,12 @@ class DiffGlobalEventFilter(QtCore.QObject):
             elif is_copy_nid:
                 _trigger_copy_nid(panel, browser)
             elif is_escape:
-                panel._on_request_close_panel()
+                # IMPORTANT : Ne JAMAIS ouvrir de dialogue modal (prompt_diff_close_decision)
+                # lors de ShortcutOverride ! Cela bloque la boucle Qt et provoque un double déclenchement
+                # sur l'événement KeyPress consécutif. On accepte le ShortcutOverride pour empêcher
+                # la fermeture brutale par Anki natif, et l'action s'exécute uniquement sur KeyPress.
+                event.accept()
+                return True
             elif is_up:
                 panel._select_previous_card()
             elif is_down:
@@ -856,7 +923,7 @@ class DiffGlobalEventFilter(QtCore.QObject):
             return True
         else:
             # KeyPress
-            if self._last_override_key == key and (now - self._last_override_time) < 0.15:
+            if self._last_override_key == key and not is_escape and (now - self._last_override_time) < 0.15:
                 self._last_override_key = None
                 event.accept()
                 return True
@@ -865,6 +932,8 @@ class DiffGlobalEventFilter(QtCore.QObject):
                 panel._accept_all_current()
             elif is_reject:
                 panel._reject_all_current()
+            elif is_accept_tags:
+                panel._accept_tags_only_current()
             elif is_history:
                 panel._toggle_history_tab()
             elif is_copy:
@@ -1083,6 +1152,16 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                 sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
                 sc.setContext(_Qt.ShortcutContext.WidgetWithChildrenShortcut)
                 sc.activated.connect(self._reject_all_current)
+                self._shortcuts.append(sc)
+            except Exception:
+                pass
+
+        # Accepter uniquement les tags : F4, Alt+Shift+T, Ctrl+Alt+Shift+T
+        for key in ("F4", "Alt+Shift+T", "Ctrl+Alt+Shift+T"):
+            try:
+                sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+                sc.setContext(_Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                sc.activated.connect(self._accept_tags_only_current)
                 self._shortcuts.append(sc)
             except Exception:
                 pass
@@ -2336,6 +2415,19 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _accept_tags_only_current(self):
+        """Accepter uniquement les tags pour la note en cours ou la multi-sélection (sans impacter les champs)."""
+        panels = self._get_target_panels()
+        for panel in panels:
+            panel.accept_tags_only()
+        self._update_status()
+        try:
+            if hasattr(self._browser, "_previewer") and self._browser._previewer:
+                self._browser._previewer._last_state = None
+                self._browser._renderPreview()
+        except Exception:
+            pass
+
     def _accept_all_global(self):
         """Accepter tous les champs de toutes les notes (non exposé dans l'UI, gardé pour compatibilité)."""
         for nid, panel in self._note_panels.items():
@@ -2752,6 +2844,21 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
             self._tags_panel.refresh()
 
         self._do_sync_editor()
+        self._browser_panel._update_status()
+
+    def accept_tags_only(self) -> None:
+        """Accepte uniquement les modifications de tags sans impacter les choix faits dans les champs."""
+        if self._diff.excluded:
+            self._include_cb.setChecked(True)
+            self._diff.excluded = False
+        self._diff.tags = list(self._diff.updated_tags)
+        self._diff.tags_active_target = "PROP"
+        if hasattr(self, "_tags_panel") and self._tags_panel:
+            self._tags_panel.refresh()
+
+        editor = self._browser_panel.get_editor_for_note(self._diff.note_id)
+        if editor:
+            sync_tags_to_editor(editor, self._diff.tags)
         self._browser_panel._update_status()
 
     def reject_all_hunks(self) -> None:
@@ -3180,7 +3287,7 @@ def _inject_editor_web_shortcuts(editor: Any) -> None:
                 return;
             }}
 
-            // Touches F2 et F3 : TOUJOURS actives en mode diff, peu importe la cible ou le focus
+            // Touches F2, F3 et F4 : TOUJOURS actives en mode diff, peu importe la cible ou le focus
             if (key === "F2" && !hasAlt && !hasCtrl && !hasShift) {{
                 e.preventDefault();
                 e.stopPropagation();
@@ -3191,6 +3298,12 @@ def _inject_editor_web_shortcuts(editor: Any) -> None:
                 e.preventDefault();
                 e.stopPropagation();
                 sendBridge("diff_reject_note");
+                return;
+            }}
+            if (key === "F4" && !hasAlt && !hasCtrl && !hasShift) {{
+                e.preventDefault();
+                e.stopPropagation();
+                sendBridge("diff_accept_tags_only");
                 return;
             }}
 
@@ -3225,6 +3338,11 @@ def _inject_editor_web_shortcuts(editor: Any) -> None:
                 (hasCtrl && hasShift && (key === "r" || key === "R"))
             );
 
+            var isAcceptTags = (
+                (hasAlt && hasShift && !hasCtrl && (key === "t" || key === "T")) ||
+                (hasCtrl && hasAlt && hasShift && (key === "t" || key === "T"))
+            );
+
             if (isAccept) {{
                 e.preventDefault();
                 e.stopPropagation();
@@ -3233,6 +3351,10 @@ def _inject_editor_web_shortcuts(editor: Any) -> None:
                 e.preventDefault();
                 e.stopPropagation();
                 sendBridge("diff_reject_note");
+            }} else if (isAcceptTags) {{
+                e.preventDefault();
+                e.stopPropagation();
+                sendBridge("diff_accept_tags_only");
             }}
         }}
 
@@ -3266,6 +3388,12 @@ def _on_editor_did_init_shortcuts(cuts: List[Any], editor: Any) -> None:
             if force or not _is_inside_field(_browser_panel):
                 _browser_panel._reject_all_current()
 
+    def _accept_tags_action(force: bool = False):
+        global _browser_panel, _pending_diffs
+        if _browser_panel and _pending_diffs:
+            if force or not _is_inside_field(_browser_panel):
+                _browser_panel._accept_tags_only_current()
+
     def _copy_nid_action():
         """Copie le NID de la carte en cours d'edition dans le presse-papiers.
         Delegue a Lier les cartes si disponible, sinon copie le NID brut directement."""
@@ -3275,6 +3403,7 @@ def _on_editor_did_init_shortcuts(cuts: List[Any], editor: Any) -> None:
     # F2 et F3 : TOUJOURS actifs peu importe le focus dans l'editeur
     cuts.append(("F2", lambda: _accept_action(force=True), True))
     cuts.append(("F3", lambda: _reject_action(force=True), True))
+    cuts.append(("F4", lambda: _accept_tags_action(force=True), True))
 
     # Accepter (lettres/Alt) : Alt+A, Alt+V, Ctrl+Alt+A, Alt+Y, Ctrl+Shift+A
     for key in ("Alt+A", "Alt+V", "Ctrl+Alt+A", "Alt+Y", "Ctrl+Shift+A"):
@@ -3283,6 +3412,10 @@ def _on_editor_did_init_shortcuts(cuts: List[Any], editor: Any) -> None:
     # Rejeter / Garder l'ancien (lettres/Alt) : Alt+R, Ctrl+Alt+R, Alt+N, Ctrl+Shift+R
     for key in ("Alt+R", "Ctrl+Alt+R", "Alt+N", "Ctrl+Shift+R"):
         cuts.append((key, lambda: _reject_action(force=False), True))
+
+    # Accepter uniquement les tags : Alt+Shift+T, Ctrl+Alt+Shift+T
+    for key in ("Alt+Shift+T", "Ctrl+Alt+Shift+T"):
+        cuts.append((key, lambda: _accept_tags_action(force=False), True))
 
     # Copier NID : uniquement si Lier les cartes n'est pas déjà présent pour éviter le doublon ambigu
     has_lier_cartes = False
@@ -3333,6 +3466,19 @@ def _handle_editor_bridge(editor, cmd: str) -> None:
                 diff.tags = list(diff.original_tags)
                 diff.tags_active_target = "OLD"
 
+    elif cmd == "diff_accept_tags_only":
+        if _browser_panel:
+            _browser_panel._accept_tags_only_current()
+        elif nid:
+            real_nid = _staged_to_orig.get(nid, nid)
+            diff = _pending_diffs.get(real_nid)
+            if diff:
+                if diff.excluded:
+                    diff.excluded = False
+                diff.tags = list(diff.updated_tags)
+                diff.tags_active_target = "PROP"
+                sync_tags_to_editor(editor, diff.tags)
+
     elif cmd == "diff_commit_all":
         if _browser_panel:
             _browser_panel._on_commit_all()
@@ -3365,6 +3511,10 @@ def _on_editor_will_show_context_menu(editor_webview, menu) -> None:
     reject_act = menu.addAction("Rejeter tous les changements de cette note")
     reject_act.triggered.connect(
         lambda: _handle_editor_bridge(editor, "diff_reject_note")
+    )
+    accept_tags_act = menu.addAction("Accepter uniquement les tags de cette note")
+    accept_tags_act.triggered.connect(
+        lambda: _handle_editor_bridge(editor, "diff_accept_tags_only")
     )
     commit_act = menu.addAction("Committer tous les changements en attente")
     commit_act.triggered.connect(
@@ -3489,14 +3639,13 @@ def open_browser_diff(diffs: List[NoteDiff], on_commit) -> None:
                 and _browser_panel is not None
                 and not _committed
                 and bool(_pending_diffs)):
-            # Ne pas intercepter Echap si une QDialog modale enfant est active
-            # (ex: dialogues de lien miroir de Lier les cartes, CrossLinks, etc.)
+            # Ne pas intercepter Echap si une QDialog enfant est active
+            # (ex: dialogues de lien miroir de Lier les cartes, LinkedCardsDialog, etc.)
             app = QtWidgets.QApplication.instance()
             active_win = app.activeWindow() if app else None
             if (active_win is not None
                     and active_win is not browser
-                    and isinstance(active_win, QtWidgets.QDialog)
-                    and active_win.isModal()):
+                    and (isinstance(active_win, QtWidgets.QDialog) or hasattr(active_win, "reject"))):
                 if _orig_browser_key_press:
                     try:
                         _orig_browser_key_press(event)
@@ -3534,6 +3683,8 @@ def open_browser_diff(diffs: List[NoteDiff], on_commit) -> None:
     browser.raise_()
 
 _decision_hook = None  # Hook de test
+_is_prompting_decision = False
+_last_prompt_decision_time = 0.0
 
 
 def prompt_diff_close_decision(parent=None) -> str:
@@ -3542,91 +3693,100 @@ def prompt_diff_close_decision(parent=None) -> str:
     conserver les modifications effectuees ou revenir a l'etat anterieur a l'importation.
     Retourne 'commit', 'revert' ou 'cancel'.
     """
-    global _decision_hook
+    global _decision_hook, _is_prompting_decision, _last_prompt_decision_time
     if _decision_hook is not None:
         return _decision_hook()
 
     if os.environ.get("QT_QPA_PLATFORM") == "offscreen" or os.environ.get("PYTEST_CURRENT_TEST"):
         return "revert"
 
-    dialog = QtWidgets.QDialog(parent)
-    dialog.setWindowTitle("Fermeture de la revue des differences")
-    dialog.setModal(True)
-    dialog.resize(420, 160)
+    now = time.monotonic()
+    if _is_prompting_decision or (now - _last_prompt_decision_time < 0.6):
+        return "cancel"
+
+    _is_prompting_decision = True
+    _last_prompt_decision_time = now
     try:
-        from .ui import _get_style_base
-        dialog.setStyleSheet(_get_style_base())
-    except Exception:
-        pass
+        dialog = QtWidgets.QDialog(parent)
+        dialog.setWindowTitle("Fermeture de la revue des differences")
+        dialog.setModal(True)
+        dialog.resize(420, 160)
+        try:
+            from .ui import _get_style_base
+            dialog.setStyleSheet(_get_style_base())
+        except Exception:
+            pass
 
-    layout = QtWidgets.QVBoxLayout(dialog)
-    layout.setContentsMargins(20, 20, 20, 20)
-    layout.setSpacing(12)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
 
-    title_lbl = QtWidgets.QLabel("Des modifications d'importation sont en attente.")
-    title_lbl.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {_CLR_HDR_FG};")
-    layout.addWidget(title_lbl)
+        title_lbl = QtWidgets.QLabel("Des modifications d'importation sont en attente.")
+        title_lbl.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {_CLR_HDR_FG};")
+        layout.addWidget(title_lbl)
 
-    info_lbl = QtWidgets.QLabel(
-        "Souhaitez-vous conserver les modifications effectuees dans votre collection "
-        "ou revenir a l'etat anterieur a l'importation ?"
-    )
-    info_lbl.setWordWrap(True)
-    info_lbl.setStyleSheet(f"font-size: 12px; color: {_CLR_TEXT};")
-    layout.addWidget(info_lbl)
+        info_lbl = QtWidgets.QLabel(
+            "Souhaitez-vous conserver les modifications effectuees dans votre collection "
+            "ou revenir a l'etat anterieur a l'importation ?"
+        )
+        info_lbl.setWordWrap(True)
+        info_lbl.setStyleSheet(f"font-size: 12px; color: {_CLR_TEXT};")
+        layout.addWidget(info_lbl)
 
-    btn_layout = QtWidgets.QVBoxLayout()
-    btn_layout.setSpacing(8)
+        btn_layout = QtWidgets.QVBoxLayout()
+        btn_layout.setSpacing(8)
 
-    btn_keep = QtWidgets.QPushButton("Conserver les modifications")
-    btn_keep.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
-    btn_keep.setFixedHeight(30)
-    try:
-        btn_keep.setStyleSheet(_get_style_btn_primary())
-    except Exception:
-        pass
+        btn_keep = QtWidgets.QPushButton("Conserver les modifications")
+        btn_keep.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
+        btn_keep.setFixedHeight(30)
+        try:
+            btn_keep.setStyleSheet(_get_style_btn_primary())
+        except Exception:
+            pass
 
-    btn_revert = QtWidgets.QPushButton("Revenir avant l'importation")
-    btn_revert.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
-    btn_revert.setFixedHeight(30)
-    try:
-        btn_revert.setStyleSheet(_get_style_btn_danger())
-    except Exception:
-        pass
+        btn_revert = QtWidgets.QPushButton("Revenir avant l'importation")
+        btn_revert.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
+        btn_revert.setFixedHeight(30)
+        try:
+            btn_revert.setStyleSheet(_get_style_btn_danger())
+        except Exception:
+            pass
 
-    btn_cancel = QtWidgets.QPushButton("Annuler")
-    btn_cancel.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
-    btn_cancel.setFixedHeight(28)
-    try:
-        btn_cancel.setStyleSheet(_get_style_btn_secondary())
-    except Exception:
-        pass
+        btn_cancel = QtWidgets.QPushButton("Annuler")
+        btn_cancel.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
+        btn_cancel.setFixedHeight(28)
+        try:
+            btn_cancel.setStyleSheet(_get_style_btn_secondary())
+        except Exception:
+            pass
 
-    btn_layout.addWidget(btn_keep)
-    btn_layout.addWidget(btn_revert)
-    btn_layout.addWidget(btn_cancel)
-    layout.addLayout(btn_layout)
+        btn_layout.addWidget(btn_keep)
+        btn_layout.addWidget(btn_revert)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
 
-    decision = ["cancel"]
+        decision = ["cancel"]
 
-    def on_keep():
-        decision[0] = "commit"
-        dialog.accept()
+        def on_keep():
+            decision[0] = "commit"
+            dialog.accept()
 
-    def on_revert():
-        decision[0] = "revert"
-        dialog.accept()
+        def on_revert():
+            decision[0] = "revert"
+            dialog.accept()
 
-    def on_cancel():
-        decision[0] = "cancel"
-        dialog.reject()
+        def on_cancel():
+            decision[0] = "cancel"
+            dialog.reject()
 
-    btn_keep.clicked.connect(on_keep)
-    btn_revert.clicked.connect(on_revert)
-    btn_cancel.clicked.connect(on_cancel)
+        btn_keep.clicked.connect(on_keep)
+        btn_revert.clicked.connect(on_revert)
+        btn_cancel.clicked.connect(on_cancel)
 
-    dialog.exec()
-    return decision[0]
+        dialog.exec()
+        return decision[0]
+    finally:
+        _is_prompting_decision = False
 
 
 def _on_browser_menus_did_init(browser) -> None:
@@ -3662,9 +3822,11 @@ def _on_browser_will_show_context_menu(browser, menu) -> None:
             if count == 1:
                 label_acc = "Diff : Accepter les modifications"
                 label_rej = "Diff : Garder l'ancien (rejeter)"
+                label_tags = "Diff : Accepter uniquement les tags"
             else:
                 label_acc = f"Diff : Accepter les modifications ({count} notes)"
                 label_rej = f"Diff : Garder l'ancien ({count} notes)"
+                label_tags = f"Diff : Accepter uniquement les tags ({count} notes)"
 
             def _restore_focus():
                 try:
@@ -3704,11 +3866,23 @@ def _on_browser_will_show_context_menu(browser, menu) -> None:
                 QtCore.QTimer.singleShot(0, _restore_focus)
                 QtCore.QTimer.singleShot(50, _restore_focus)
 
+            def _accept_tags_selected():
+                for p in matching_panels:
+                    p.accept_tags_only()
+                if _browser_panel:
+                    _browser_panel._update_status()
+                _restore_focus()
+                QtCore.QTimer.singleShot(0, _restore_focus)
+                QtCore.QTimer.singleShot(50, _restore_focus)
+
             act_acc = menu.addAction(label_acc)
             act_acc.triggered.connect(_accept_selected)
 
             act_rej = menu.addAction(label_rej)
             act_rej.triggered.connect(_reject_selected)
+
+            act_tags = menu.addAction(label_tags)
+            act_tags.triggered.connect(_accept_tags_selected)
             menu.addSeparator()
 
     action = menu.addAction("Historique & AnkiCollab...")

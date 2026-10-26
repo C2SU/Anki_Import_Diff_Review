@@ -306,7 +306,7 @@ def _get_style_base() -> str:
 QDialog, QWidget {{
     background-color: {c['background']};
     color: {c['text_primary']};
-    font-family: "Segoe UI", "Inter", -apple-system, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-size: 13px;
 }}
 QSplitter::handle {{
@@ -821,6 +821,47 @@ def _unfold_and_style_html(raw_html: str, model_css: str, c: dict, placeholder: 
     return full_html
 
 
+class _TagsDisplayBrowser(_AutoResizingTextBrowser):
+    """
+    Zone d'affichage des tags de diff adaptée dynamiquement :
+    - Évite toute troncation même lorsque la note comporte de très nombreux tags
+    - Recalcule sa hauteur exacte en fonction de la largeur disponible dans le panneau
+    - Compatible avec l'API text() / setText() pour les tests et shims
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "background-color: transparent; border: none; padding: 0px; margin: 0px;"
+        )
+        self.document().setDocumentMargin(2)
+        self.setVerticalScrollBarPolicy(_Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(_Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._raw_html = ""
+
+    def setText(self, html_str: str):
+        self._raw_html = html_str
+        wrapped = f'<div style="line-height:175%; font-family:sans-serif; margin:0; padding:0;">{html_str}</div>'
+        self.setHtml(wrapped)
+
+    def text(self) -> str:
+        return self._raw_html or self.toHtml()
+
+    def _adjust_height(self):
+        if self._adjusting_height:
+            return
+        self._adjusting_height = True
+        try:
+            vp_rect = self.viewport().contentsRect()
+            w = vp_rect.width() if vp_rect.width() > 10 else (self.width() - 2 * self.frameWidth())
+            if w > 10:
+                self.document().setTextWidth(w)
+            doc_h = int(self.document().size().height()) + 8
+            self.setFixedHeight(max(doc_h, 24))
+        finally:
+            self._adjusting_height = False
+
+
 class TagsDiffPanel(QtWidgets.QFrame, PaletteMixin):
     """
     Panneau affichant la comparaison détaillée des tags (anciens vs nouveaux).
@@ -895,13 +936,8 @@ class TagsDiffPanel(QtWidgets.QFrame, PaletteMixin):
 
             layout.addLayout(btn_row)
 
-        # Tags content label
-        self._tags_display = QtWidgets.QLabel(self)
-        self._tags_display.setWordWrap(True)
-        self._tags_display.setTextFormat(_Qt.TextFormat.RichText)
-        self._tags_display.setTextInteractionFlags(
-            _Qt.TextInteractionFlag.TextSelectableByMouse | _Qt.TextInteractionFlag.TextSelectableByKeyboard
-        )
+        # Tags content browser (remplace QLabel pour afficher exhaustivement tous les tags sans troncation)
+        self._tags_display = _TagsDisplayBrowser(self)
         layout.addWidget(self._tags_display)
 
         self.refresh()
@@ -2019,6 +2055,9 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
         shortcuts_map = [
             ("F2", self._accept_all_global),
             ("F3", self._reject_all_global),
+            ("F4", self._accept_tags_only_global),
+            ("Alt+Shift+T", self._accept_tags_only_global),
+            ("Ctrl+Alt+Shift+T", self._accept_tags_only_global),
             ("A", self._accept_all_global),
             ("Alt+A", self._accept_all_global),
             ("Alt+V", self._accept_all_global),
@@ -2490,6 +2529,15 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
                     hw._refresh_state()
                 if fp._hunk_widgets:
                     fp._refresh_preview()
+            if hasattr(panel, "_tags_panel") and panel._tags_panel:
+                panel._tags_panel.refresh()
+        self._update_status()
+
+    def _accept_tags_only_global(self):
+        for note in self.note_diffs:
+            note.tags = list(note.updated_tags)
+            note.tags_active_target = "PROP"
+        for panel in self._note_panels.values():
             if hasattr(panel, "_tags_panel") and panel._tags_panel:
                 panel._tags_panel.refresh()
         self._update_status()

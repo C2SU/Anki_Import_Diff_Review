@@ -658,7 +658,7 @@ class AnkiCollabHistoryPanel(QtWidgets.QWidget):
         c = get_colors()
         self.setStyleSheet(
             f"QWidget {{ background-color: {c['background']}; color: {c['text_primary']}; "
-            f"font-family: 'Segoe UI', 'Inter', sans-serif; }}"
+            f"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}"
         )
 
         root = QtWidgets.QVBoxLayout(self)
@@ -1229,7 +1229,7 @@ class AnkiCollabHistoryDialog(QtWidgets.QDialog):
         c = get_colors()
         self.setStyleSheet(
             f"QDialog {{ background-color: {c['background']}; color: {c['text_primary']}; "
-            f"font-family: 'Segoe UI', 'Inter', sans-serif; }}"
+            f"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}"
         )
 
         layout = QtWidgets.QVBoxLayout(self)
