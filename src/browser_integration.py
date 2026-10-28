@@ -51,7 +51,7 @@ except ImportError:
     _AlignFlag = QtCore.Qt.AlignmentFlag
     _Signal = QtCore.Signal
 
-from .savepoint import NoteDiff
+from .savepoint import NoteDiff, is_note_learned, get_learned_note_ids
 from .diff import compute_hunks, apply_hunks, DiffHunk
 from .ui import (
     HunkWidget, FieldDiffPanel, TagsDiffPanel, OldFieldsPanel, safe_timer_set_text,
@@ -175,7 +175,11 @@ def _stage_insert_notes(diffs: List[NoteDiff]) -> List[int]:
     Ces notes sont supprimées si le panel est fermé sans commit (dans cleanup()).
     """
     global _staged_to_orig
-    col = aqt.mw.col
+    if not any(d.action == "INSERT" for d in diffs):
+        return []
+    col = getattr(aqt.mw, "col", None) if getattr(aqt, "mw", None) else None
+    if not col:
+        return []
     staged_nids = []
 
     for diff in diffs:
@@ -296,6 +300,10 @@ def _load_browser_layout_state() -> dict:
     try:
         if aqt.mw and getattr(aqt.mw, "addonManager", None):
             cfg = aqt.mw.addonManager.getConfig("anki_import_diff") or {}
+            if "only_changed_fields" in cfg:
+                state["only_changed_fields"] = cfg["only_changed_fields"]
+            if "learned_cards_only" in cfg:
+                state["learned_cards_only"] = cfg["learned_cards_only"]
             stored = cfg.get(_BROWSER_STATE_KEY)
             if isinstance(stored, dict) and stored:
                 state.update(stored)
@@ -388,6 +396,21 @@ def _save_browser_state(browser, editor_diff_splitter=None) -> None:
                         state["editor_zoom"] = zf
         except Exception:
             pass
+
+        # Mode de filtrage champs modifiés uniquement & cartes apprises
+        global _browser_panel
+        panel_to_check = _browser_panel or getattr(browser, "_diff_panel", None)
+        if panel_to_check is not None and not sip.isdeleted(panel_to_check):
+            if hasattr(panel_to_check, "_changed_only_cb") and panel_to_check._changed_only_cb is not None:
+                try:
+                    state["only_changed_fields"] = panel_to_check._changed_only_cb.isChecked()
+                except Exception:
+                    pass
+            if hasattr(panel_to_check, "_btn_learned_only") and panel_to_check._btn_learned_only is not None:
+                try:
+                    state["learned_cards_only"] = panel_to_check._btn_learned_only.isChecked()
+                except Exception:
+                    pass
 
         if not state:
             return
@@ -511,6 +534,43 @@ QPushButton {{
 }}
 QPushButton:hover {{
     background-color: {c['danger_hover']};
+}}
+"""
+
+
+def _get_learned_btn_style(checked: bool) -> str:
+    from .ui import get_colors
+    c = get_colors()
+    if checked:
+        return f"""
+QPushButton {{
+    background-color: rgba(99, 102, 241, 0.15);
+    color: #818cf8;
+    border: 1px solid #6366f1;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QPushButton:hover {{
+    background-color: rgba(99, 102, 241, 0.25);
+    color: #a5b4fc;
+}}
+"""
+    return f"""
+QPushButton {{
+    background-color: transparent;
+    color: {c['text_secondary']};
+    border: 1px solid {c['border']};
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 500;
+}}
+QPushButton:hover {{
+    background-color: {c['surface_hover']};
+    color: {c['text_primary']};
+    border-color: {c['border']};
 }}
 """
 
@@ -954,22 +1014,6 @@ class DiffGlobalEventFilter(QtCore.QObject):
 # DiffBrowserPanel — Panneau injecte dans le splitter de l'explorateur
 # ---------------------------------------------------------------------------
 
-class DiffBrowserPanel(QtWidgets.QWidget):
-    """
-    QWidget injecte directement dans form.splitter[1] de l'explorateur Anki,
-    cote a cote avec l'editeur natif (QSplitter horizontal).
-
-    Architecture :
-      form.splitter (vertical) :
-        [0] tableView
-        [1] _editor_diff_splitter (QSplitter horizontal) :
-              [0] form.fieldsArea  (editeur natif Anki)
-              [1] DiffBrowserPanel  (notre panel diff)
-
-    Quand Anki cache widget(1) (aucune carte selectionnee), tout le bas
-    se cache, incluant notre panel. La visibilite reste coherente.
-    """
-
 class _LazyNotePanelsDict(dict):
     """Dictionnaire à instanciation paresseuse pour les panels NoteDiffPanelWithSync."""
     def __init__(self, panel_container):
@@ -1007,6 +1051,8 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         super().__init__(browser)
         self.setObjectName("diffBrowserPanel")
         self._browser = browser
+        if browser is not None:
+            browser._diff_panel = self
         self._current_nid: Optional[int] = None
         self._last_diff_nid: Optional[int] = None
         self._current_editor = None  # reference a l'editeur actif dans le browser
@@ -1017,6 +1063,11 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         self._pre_diff_main_splitter_state: Optional[bytes] = None
         self._save_timer: Optional[QtCore.QTimer] = None
         self._event_filter: Optional[DiffGlobalEventFilter] = None
+        layout_state = _load_browser_layout_state()
+        self._only_changed_fields: bool = layout_state.get("only_changed_fields", True)
+        self._changed_only_cb: Optional[QtWidgets.QCheckBox] = None
+        self._learned_cards_only: bool = layout_state.get("learned_cards_only", False)
+        self._btn_learned_only: Optional[QtWidgets.QPushButton] = None
 
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Ignored,
@@ -1032,6 +1083,8 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         gui_hooks.browser_did_change_row.append(self._on_browser_row_changed)
         self._install_field_edit_hook()
         _patch_editor_save_for_diff()
+        if self._learned_cards_only:
+            self._apply_learned_cards_filter(True)
 
     def _inject_into_browser_splitter(self) -> None:
         """
@@ -1115,6 +1168,109 @@ class DiffBrowserPanel(QtWidgets.QWidget):
             self._save_timer.setInterval(300)
             self._save_timer.timeout.connect(self._save_current_layout)
         self._save_timer.start()
+
+    def _on_changed_only_toggled(self, checked: bool) -> None:
+        self._only_changed_fields = checked
+        for p in list(self._note_panels.values()):
+            if p is not None and hasattr(p, "set_only_changed_filter"):
+                p.set_only_changed_filter(checked)
+        self._save_current_layout()
+
+    def _update_learned_btn_style(self) -> None:
+        if hasattr(self, "_btn_learned_only") and self._btn_learned_only is not None:
+            self._btn_learned_only.setStyleSheet(_get_learned_btn_style(self._btn_learned_only.isChecked()))
+
+    def _on_learned_only_toggled(self, checked: bool) -> None:
+        self._learned_cards_only = checked
+        self._update_learned_btn_style()
+        self._apply_learned_cards_filter(checked)
+        self._save_current_layout()
+
+    def get_learned_diff_nids(self) -> List[int]:
+        """Retourne la liste ordonnée des IDs de notes du diff possédant au moins une carte apprise."""
+        col = getattr(self._browser, "col", None) or getattr(aqt.mw, "col", None)
+        update_nids = [d.note_id for d in _pending_diffs.values() if d.action != "INSERT"]
+        if not update_nids:
+            return []
+        learned_set = get_learned_note_ids(update_nids, col)
+        return [nid for nid in update_nids if nid in learned_set]
+
+    def _apply_learned_cards_filter(self, checked: bool) -> None:
+        if not _pending_diffs:
+            return
+
+        if checked:
+            learned_nids = self.get_learned_diff_nids()
+            if learned_nids:
+                search_str = "nid:" + ",".join(str(nid) for nid in learned_nids)
+                if self._browser and hasattr(self._browser, "search_for"):
+                    self._browser.search_for(search_str)
+
+                target_sel = self._current_nid if self._current_nid in learned_nids else learned_nids[0]
+                self.select_note(target_sel)
+
+                col = getattr(self._browser, "col", None) or getattr(aqt.mw, "col", None)
+                if col and hasattr(self._browser, "table") and self._browser.table is not None:
+                    card_ids = []
+                    try:
+                        if hasattr(col, "card_ids_of_note"):
+                            card_ids = col.card_ids_of_note(target_sel)
+                        else:
+                            n = col.get_note(target_sel)
+                            if n:
+                                card_ids = n.card_ids()
+                    except Exception:
+                        pass
+                    if card_ids and hasattr(self._browser.table, "select_single_card"):
+                        self._browser.table.select_single_card(card_ids[0])
+            else:
+                if self._browser and hasattr(self._browser, "search_for"):
+                    self._browser.search_for("nid:0")
+                if hasattr(self, "_no_learned_widget") and self._no_learned_widget is not None:
+                    self._diff_stack.setCurrentWidget(self._no_learned_widget)
+        else:
+            self._back_to_diff_notes()
+
+        self._update_status()
+
+    def _create_no_learned_widget(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        w.setStyleSheet(f"background-color:{_CLR_PANEL};")
+        layout = QtWidgets.QVBoxLayout(w)
+        layout.setContentsMargins(20, 24, 20, 20)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Aucune carte apprise modifiée", w)
+        title.setStyleSheet(f"color:{_CLR_TEXT}; font-size:13px; font-weight:700;")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        badge = QtWidgets.QLabel("0 carte apprise parmi les modifications", w)
+        badge.setStyleSheet(
+            f"color:{_CLR_SUBTEXT}; font-size:11px; font-weight:600; background:{_CLR_HDR_BG}; "
+            f"border:1px solid {_CLR_BORDER}; border-radius:10px; padding:3px 10px;"
+        )
+        layout.addWidget(badge)
+
+        desc = QtWidgets.QLabel(
+            "Toutes les modifications en attente concernent de nouvelles cartes ou des cartes non encore révisées.",
+            w,
+        )
+        desc.setStyleSheet(f"color:{_CLR_SUBTEXT}; font-size:12px; line-height:1.45;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        layout.addSpacing(8)
+
+        btn_all = QtWidgets.QPushButton("Afficher toutes les modifications", w)
+        btn_all.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
+        btn_all.setStyleSheet(_get_style_btn_primary())
+        btn_all.setMinimumHeight(28)
+        btn_all.clicked.connect(lambda: self._btn_learned_only.setChecked(False) if getattr(self, "_btn_learned_only", None) else None)
+        layout.addWidget(btn_all)
+
+        layout.addStretch()
+        return w
 
     def _save_current_layout(self) -> None:
         try:
@@ -1633,7 +1789,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                     pass
             self._shortcuts.clear()
 
-        for btn_attr in ("_acc_all_btn", "_rej_all_btn", "_commit_btn", "_reject_import_btn", "_close_panel_btn"):
+        for btn_attr in ("_acc_all_btn", "_rej_all_btn", "_commit_btn", "_reject_import_btn", "_close_panel_btn", "_changed_only_cb", "_btn_learned_only"):
             if hasattr(self, btn_attr) and getattr(self, btn_attr) is not None:
                 try:
                     btn = getattr(self, btn_attr)
@@ -1717,6 +1873,48 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         self._status_lbl.setStyleSheet(f"color:{_CLR_SUBTEXT}; font-size:11px;")
         self._status_lbl.setWordWrap(True)
         toolbar.addWidget(self._status_lbl)
+
+        # Row 1c: Option Champs modifiés uniquement (pré-coché par défaut)
+        row_opts = QtWidgets.QHBoxLayout()
+        row_opts.setContentsMargins(0, 0, 0, 0)
+        row_opts.setSpacing(6)
+
+        self._changed_only_cb = QtWidgets.QCheckBox("Champs modifiés uniquement")
+        self._changed_only_cb.setObjectName("dock_changed_only_cb")
+        self._changed_only_cb.setChecked(self._only_changed_fields)
+        self._changed_only_cb.setStyleSheet(f"""
+            QCheckBox {{
+                color: {_CLR_TEXT};
+                font-size: 11px;
+                font-weight: 500;
+                spacing: 6px;
+            }}
+            QCheckBox:hover {{
+                color: {_CLR_HDR_FG};
+            }}
+        """)
+        self._changed_only_cb.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
+        self._changed_only_cb.setToolTip("Afficher uniquement les champs ayant des modifications dans cette note")
+        self._changed_only_cb.toggled.connect(self._on_changed_only_toggled)
+        row_opts.addWidget(self._changed_only_cb)
+        row_opts.addStretch()
+        toolbar.addLayout(row_opts)
+
+        # Row 1d: Bouton filtre Cartes déjà apprises uniquement (nativement désactivé)
+        row_learned = QtWidgets.QHBoxLayout()
+        row_learned.setContentsMargins(0, 0, 0, 0)
+        row_learned.setSpacing(6)
+
+        self._btn_learned_only = QtWidgets.QPushButton("Cartes déjà apprises")
+        self._btn_learned_only.setObjectName("dock_learned_only_btn")
+        self._btn_learned_only.setCheckable(True)
+        self._btn_learned_only.setChecked(self._learned_cards_only)
+        self._btn_learned_only.setStyleSheet(_get_learned_btn_style(self._learned_cards_only))
+        self._btn_learned_only.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
+        self._btn_learned_only.setToolTip("Afficher uniquement les modifications des cartes déjà apprises (hors nouvelles cartes)")
+        self._btn_learned_only.toggled.connect(self._on_learned_only_toggled)
+        row_learned.addWidget(self._btn_learned_only)
+        toolbar.addLayout(row_learned)
 
         # Row 2: All / Clear Hunks for the current note
         row2 = QtWidgets.QHBoxLayout()
@@ -1833,6 +2031,8 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         self._note_panels.clear()
         self._not_in_diff_widget = self._create_not_in_diff_widget()
         self._diff_stack.addWidget(self._not_in_diff_widget)
+        self._no_learned_widget = self._create_no_learned_widget()
+        self._diff_stack.addWidget(self._no_learned_widget)
 
         if _pending_diffs and self._last_diff_nid is None:
             first_diff = next(iter(_pending_diffs.values()), None)
@@ -2018,14 +2218,22 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                 diff.tags = [t for t in new_val.strip().split(" ") if t]
                 if self._history_tab_widget is not None:
                     self._history_tab_widget._current_fields["__tags__"] = new_val
-                    self._history_tab_widget._refresh_fields_preview()
+                    self._history_tab_widget._render_comparison_view()
                 continue
             fp = panel._field_panels.get(fname)
             if fp is not None:
+                from .diff import compute_hunks
                 fp.new_val = new_val
+                fp.prop_mod = new_val
+                fp.active_target = "PROP"
+                if diff is not None:
+                    diff.prop_mod_fields[fname] = new_val
+                    diff.field_active_target[fname] = "PROP"
+                    diff.merged_fields[fname] = new_val
                 fp.hunks = compute_hunks(fp.old_val, new_val)
                 for h in fp.hunks:
                     h.accepted = True
+                fp._refresh_display()
                 fp.previewChanged.emit()
         panel._sync_all_merged_then_editor()
 
@@ -2044,6 +2252,7 @@ class DiffBrowserPanel(QtWidgets.QWidget):
                     hw.hunk.accepted = False
                     hw._protected = True
                     hw._refresh_state()
+                fp._refresh_display()
                 fp.previewChanged.emit()
 
     def _on_history_protection_tags_applied(self, note_id: int, tags: List[str]) -> None:
@@ -2107,6 +2316,9 @@ class DiffBrowserPanel(QtWidgets.QWidget):
 
     def get_diff_search_nids(self) -> List[int]:
         """Retourne la liste des IDs de notes de la collection correspondant aux diffs en attente."""
+        if getattr(self, "_learned_cards_only", False):
+            learned = self.get_learned_diff_nids()
+            return learned
         search_nids = []
         for d in _pending_diffs.values():
             if d.action == "INSERT" and d.staged_note_id:
@@ -2121,6 +2333,8 @@ class DiffBrowserPanel(QtWidgets.QWidget):
         """Construit la requête de recherche Anki pour afficher toutes les cartes en cours de révision."""
         nids = self.get_diff_search_nids()
         if not nids:
+            if getattr(self, "_learned_cards_only", False):
+                return "nid:0"
             return ""
         return "nid:" + ",".join(str(nid) for nid in nids)
 
@@ -2131,22 +2345,28 @@ class DiffBrowserPanel(QtWidgets.QWidget):
 
         search_nids = self.get_diff_search_nids()
         search_str = self.get_diff_search_str()
+
+        if getattr(self, "_learned_cards_only", False) and not search_nids:
+            if self._browser and hasattr(self._browser, "search_for"):
+                self._browser.search_for("nid:0")
+            if hasattr(self, "_no_learned_widget") and self._no_learned_widget is not None:
+                self._diff_stack.setCurrentWidget(self._no_learned_widget)
+            return
+
         if not search_str or not search_nids:
             return
 
         # Déterminer la note cible à afficher : la dernière vue dans le diff ou la première
         target_nid = None
-        if self._last_diff_nid is not None:
+        if self._last_diff_nid is not None and self._last_diff_nid in search_nids:
+            target_nid = self._last_diff_nid
+        elif self._last_diff_nid is not None:
             real_orig = _staged_to_orig.get(self._last_diff_nid, self._last_diff_nid)
-            if real_orig in _pending_diffs or self._last_diff_nid in _pending_diffs:
-                target_nid = self._last_diff_nid
+            if real_orig in search_nids:
+                target_nid = real_orig
 
         if target_nid is None:
-            first_diff = next(iter(_pending_diffs.values()), None)
-            if first_diff:
-                target_nid = first_diff.staged_note_id if (first_diff.action == "INSERT" and first_diff.staged_note_id) else first_diff.note_id
-            else:
-                target_nid = search_nids[0]
+            target_nid = search_nids[0]
 
         # Déterminer le note_id dans la collection Anki pour la sélection de carte
         col_nid = target_nid
@@ -2509,8 +2729,19 @@ class DiffBrowserPanel(QtWidgets.QWidget):
             import traceback
             traceback.print_exc()
 
+        # Sauvegarder le callback on_commit avant que cleanup() ne le reinitialise
+        global _on_commit_cb
+        cb = _on_commit_cb
+        _on_commit_cb = None
+
         self._restore_browser_splitter()
         self.cleanup()
+
+        if cb is not None:
+            try:
+                cb(accepted)
+            except Exception as e_cb:
+                print(f'[anki_import_diff] _on_commit_cb error: {e_cb}')
 
         try:
             aqt.utils.tooltip("Modifications enregistrées dans la collection.")
@@ -2596,8 +2827,14 @@ class DiffBrowserPanel(QtWidgets.QWidget):
             for fp in panel.get_field_panels().values():
                 total_hunks += len(fp.hunks)
                 accepted_hunks += sum(1 for h in fp.hunks if h.accepted)
+
+        if hasattr(self, "_btn_learned_only") and self._btn_learned_only is not None:
+            learned_count = len(self.get_learned_diff_nids())
+            self._btn_learned_only.setText(f"Cartes déjà apprises ({learned_count})")
+
+        filter_suffix = "  ·  Filtre : cartes apprises" if getattr(self, "_learned_cards_only", False) else ""
         self._status_lbl.setText(
-            f"{included_notes}/{total} note(s) incluse(s)  ·  {accepted_hunks}/{total_hunks} hunks acceptés"
+            f"{included_notes}/{total} note(s) incluse(s)  ·  {accepted_hunks}/{total_hunks} hunks acceptés{filter_suffix}"
         )
         self._commit_btn.setEnabled(included_notes > 0)
 
@@ -2625,6 +2862,15 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
         self._sync_timer.setSingleShot(True)
         self._sync_timer.setInterval(30)  # 30 ms : regroupe les rafales de signaux
         self._sync_timer.timeout.connect(self._do_sync_editor)
+        self._only_changed: bool = getattr(browser_panel, "_only_changed_fields", True)
+        self._unchanged_expanded: bool = False
+        self._protected_fields: Dict[str, str] = {}
+        try:
+            from .history import ProtectedFieldsDB
+            pdb = ProtectedFieldsDB.instance() if hasattr(ProtectedFieldsDB, "instance") else ProtectedFieldsDB()
+            self._protected_fields = pdb.get_all_protected(diff.note_id)
+        except Exception:
+            pass
 
         self.setWidgetResizable(True)
         self.setSizePolicy(
@@ -2740,9 +2986,10 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
         for field_name in diff.field_names:
             old_val = diff.original_fields.get(field_name, "")
             new_val = diff.updated_fields.get(field_name, "")
+            is_protected = field_name in self._protected_fields
 
             fp = FieldDiffPanel(field_name, old_val, new_val,
-                                model_css=model_css, diff=diff, parent=container)
+                                model_css=model_css, protected=is_protected, diff=diff, parent=container)
             # Connecter les changements pour synchroniser l'éditeur
             fp.previewChanged.connect(
                 lambda fn=field_name, fp_=fp: self._on_field_hunk_changed(fn, fp_)
@@ -2751,8 +2998,85 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
             fp.setEnabled(not diff.excluded)
             layout.addWidget(fp)
 
+        # Message informatif si aucun champ texte n'a été modifié
+        self._no_fields_changed_lbl = QtWidgets.QLabel("Aucun champ modifié à cette note.", container)
+        self._no_fields_changed_lbl.setStyleSheet(
+            f"color:{_CLR_SUBTEXT}; font-size:11px; font-style:italic; padding:12px; background:transparent;"
+        )
+        self._no_fields_changed_lbl.setAlignment(_Qt.AlignmentFlag.AlignCenter)
+        self._no_fields_changed_lbl.setVisible(False)
+        layout.addWidget(self._no_fields_changed_lbl)
+
+        # Bouton tiroir pour afficher / masquer les champs inchangés
+        self._unchanged_toggle_btn = QtWidgets.QPushButton(container)
+        self._unchanged_toggle_btn.setObjectName("toggle_unchanged_fields_btn")
+        self._unchanged_toggle_btn.setCursor(QtGui.QCursor(_Qt.CursorShape.PointingHandCursor))
+        self._unchanged_toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {_CLR_SUBTEXT};
+                border: 1px dashed {_CLR_BORDER};
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-size: 11px;
+                font-weight: 500;
+                margin-top: 6px;
+                margin-bottom: 6px;
+            }}
+            QPushButton:hover {{
+                background-color: {_CLR_SEL};
+                color: {_CLR_TEXT};
+                border-style: solid;
+            }}
+        """)
+        self._unchanged_toggle_btn.setVisible(False)
+        self._unchanged_toggle_btn.clicked.connect(self._on_toggle_unchanged_clicked)
+        layout.addWidget(self._unchanged_toggle_btn)
+
         layout.addStretch()
         self.setWidget(container)
+
+        self._update_fields_visibility()
+
+    def _on_toggle_unchanged_clicked(self) -> None:
+        self._unchanged_expanded = not self._unchanged_expanded
+        self._update_fields_visibility()
+
+    def set_only_changed_filter(self, enabled: bool) -> None:
+        self._only_changed = enabled
+        self._unchanged_expanded = False
+        self._update_fields_visibility()
+
+    def _update_fields_visibility(self) -> None:
+        changed_count = 0
+        unchanged_count = 0
+        for fp in self._field_panels.values():
+            if fp.is_changed():
+                changed_count += 1
+                fp.setVisible(True)
+            else:
+                unchanged_count += 1
+                if not self._only_changed or self._unchanged_expanded:
+                    fp.setVisible(True)
+                else:
+                    fp.setVisible(False)
+
+        # Message informatif si aucun champ n'a été modifié
+        if self._only_changed and changed_count == 0:
+            self._no_fields_changed_lbl.setVisible(True)
+        else:
+            self._no_fields_changed_lbl.setVisible(False)
+
+        # Bouton tiroir pour les champs inchangés
+        if self._only_changed and unchanged_count > 0:
+            self._unchanged_toggle_btn.setVisible(True)
+            if self._unchanged_expanded:
+                txt = "Masquer le champ inchangé" if unchanged_count == 1 else f"Masquer les {unchanged_count} champs inchangés"
+            else:
+                txt = "+ Afficher le champ inchangé" if unchanged_count == 1 else f"+ Afficher les {unchanged_count} champs inchangés"
+            self._unchanged_toggle_btn.setText(txt)
+        else:
+            self._unchanged_toggle_btn.setVisible(False)
 
     def _on_tags_changed(self) -> None:
         editor = self._browser_panel.get_editor_for_note(self._diff.note_id)
@@ -2764,6 +3088,7 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
         fp = self._field_panels.get(field_name)
         if fp:
             fp.on_editor_modified(new_val)
+        self._update_fields_visibility()
         self._browser_panel._update_status()
 
     def set_editor(self, editor) -> None:
@@ -2799,6 +3124,7 @@ class NoteDiffPanelWithSync(QtWidgets.QScrollArea):
         if all(h.accepted for h in fp.hunks):
             self._diff.custom_edit_fields.pop(field_name, None)
         self._sync_all_merged_then_editor()
+        self._update_fields_visibility()
         self._browser_panel._update_status()
 
     def _on_include_toggled(self, checked: bool) -> None:
@@ -3194,7 +3520,7 @@ def _on_editor_did_init(editor) -> None:
     def patched_bridge(cmd: str):
         # Only intercept specific import diff commands. Other commands like diff_history_cmd
         # must fall back to the original bridge handler.
-        if cmd in ("diff_accept_note", "diff_reject_note", "diff_commit_all", "diff_previous_card", "diff_next_card"):
+        if cmd in ("diff_accept_note", "diff_reject_note", "diff_commit_all", "diff_previous_card", "diff_next_card", "diff_accept_tags_only"):
             _handle_editor_bridge(editor, cmd)
             return
         elif cmd == "diff_editor_escape":
@@ -3526,6 +3852,39 @@ def _on_editor_will_show_context_menu(editor_webview, menu) -> None:
 # Point d'entrée public
 # ---------------------------------------------------------------------------
 
+def _is_panel_alive(panel) -> bool:
+    """Vérifie si le panel de diff existe encore côté C++ et est visible."""
+    if panel is None:
+        return False
+    try:
+        from aqt.qt import sip
+        if hasattr(sip, "isdeleted"):
+            try:
+                if sip.isdeleted(panel):
+                    return False
+            except TypeError:
+                pass
+        if hasattr(panel, "isVisible"):
+            return bool(panel.isVisible())
+        return True
+    except Exception:
+        return False
+
+
+def is_diff_session_active() -> bool:
+    """Vérifie si une session de diff est active et en attente de révision."""
+    global _browser_panel, _pending_diffs, _committed
+    return bool(_browser_panel is not None and _is_panel_alive(_browser_panel) and _pending_diffs and not _committed)
+
+
+def get_active_browser_panel() -> Optional[DiffBrowserPanel]:
+    """Retourne l'instance active du panneau de diff dans le browser si vivante."""
+    global _browser_panel
+    if _browser_panel is not None and _is_panel_alive(_browser_panel):
+        return _browser_panel
+    return None
+
+
 def open_browser_diff(diffs: List[NoteDiff], on_commit) -> None:
     """
     Ouvre l'explorateur Anki filtré sur les notes modifiées et attache
@@ -3534,10 +3893,88 @@ def open_browser_diff(diffs: List[NoteDiff], on_commit) -> None:
     Les notes INSERT sont pré-insérées temporairement dans la collection pour
     être visibles dans le browser. Elles sont supprimées si l'utilisateur annule.
     """
-    global _browser_panel
-    set_pending_diffs(diffs, on_commit)
+    global _browser_panel, _pending_diffs, _on_commit_cb
 
-    # Pré-insérer les notes INSERT pour qu'elles soient visibles dans le browser
+    if not diffs:
+        return
+
+    incoming_nids = set(d.note_id for d in diffs)
+
+    # Vérifier si le panel existe encore côté C++ (peut être détruit si le browser a été fermé)
+    _panel_alive = _is_panel_alive(_browser_panel)
+    if not _panel_alive:
+        _browser_panel = None
+
+    # 1. Garde contre les appels concurrents / doublons :
+    # Si une session de diff est déjà active et visible dans l'explorateur
+    if _panel_alive and _pending_diffs:
+        current_nids = set(_pending_diffs.keys())
+        if incoming_nids and incoming_nids.issubset(current_nids):
+            print("[anki-diff] open_browser_diff: appel doublon ignoré, conservation de la session active.")
+            try:
+                browser = getattr(_browser_panel, "_browser", None) or aqt.dialogs.open("Browser", aqt.mw)
+                browser.activateWindow()
+                browser.raise_()
+            except Exception:
+                pass
+            return
+
+        # S'il s'agit de nouvelles notes complémentaires (ex. pull AnkiCollab multi-paquets) :
+        # Fusionner dans la session active sans détruire l'état de revue de l'utilisateur
+        new_diffs = [d for d in diffs if d.note_id not in _pending_diffs]
+        if new_diffs:
+            print(f"[anki-diff] open_browser_diff: fusion de {len(new_diffs)} nouvelles notes dans la session active.")
+            for d in new_diffs:
+                _pending_diffs[d.note_id] = d
+            _stage_insert_notes(new_diffs)
+
+            # Chaînage des callbacks de commit
+            old_cb = _on_commit_cb
+            new_cb = on_commit
+
+            def chained_on_commit(all_accepted):
+                if old_cb:
+                    try:
+                        old_cb([d for d in all_accepted if d.note_id in current_nids])
+                    except Exception as e_old:
+                        print(f"[anki-diff] Erreur callback commit précédent: {e_old}")
+                if new_cb:
+                    try:
+                        new_cb([d for d in all_accepted if d.note_id in incoming_nids])
+                    except Exception as e_new:
+                        print(f"[anki-diff] Erreur callback commit nouveau: {e_new}")
+
+            _on_commit_cb = chained_on_commit
+
+            search_nids = []
+            for d in _pending_diffs.values():
+                if d.action == "INSERT" and d.staged_note_id:
+                    search_nids.append(d.staged_note_id)
+                elif d.action != "INSERT":
+                    search_nids.append(d.note_id)
+            if not search_nids:
+                search_nids = list(_pending_diffs.keys())
+            search_str = "nid:" + ",".join(str(nid) for nid in search_nids)
+
+            browser = getattr(_browser_panel, "_browser", None) or aqt.dialogs.open("Browser", aqt.mw)
+            browser.search_for(search_str)
+            _browser_panel._update_status()
+            browser.activateWindow()
+            browser.raise_()
+            return
+
+    # 2. Si un ancien panel était vivant mais doit être réinitialisé :
+    # Nettoyer l'ancienne session AVANT d'enregistrer les nouveaux diffs
+    if _panel_alive and _browser_panel is not None:
+        try:
+            _browser_panel.cleanup()
+            _browser_panel.close()
+        except Exception:
+            pass
+        _browser_panel = None
+
+    # 3. Enregistrer les nouveaux diffs et pré-insérer les notes INSERT
+    set_pending_diffs(diffs, on_commit)
     _stage_insert_notes(diffs)
 
     # Construire le filtre : utiliser les staged_note_id pour les INSERT, note_id pour le reste
@@ -3555,25 +3992,7 @@ def open_browser_diff(diffs: List[NoteDiff], on_commit) -> None:
     browser = aqt.dialogs.open("Browser", aqt.mw)
     browser.search_for(search_str)
 
-    # Vérifier si le panel existe encore côté C++ (peut être détruit si le browser a été fermé)
-    _panel_alive = False
-    if _browser_panel is not None:
-        try:
-            from aqt.qt import sip
-            _panel_alive = not sip.isdeleted(_browser_panel) and _browser_panel.isVisible()
-        except RuntimeError:
-            _browser_panel = None
-
-    if not _panel_alive:
-        _browser_panel = DiffBrowserPanel(browser)
-    else:
-        # Réinitialiser avec les nouveaux diffs
-        try:
-            _browser_panel.cleanup()
-            _browser_panel.close()
-        except Exception:
-            pass
-        _browser_panel = DiffBrowserPanel(browser)
+    _browser_panel = DiffBrowserPanel(browser)
 
     editor = getattr(browser, "editor", None)
     if editor:
@@ -3884,6 +4303,12 @@ def _on_browser_will_show_context_menu(browser, menu) -> None:
             act_tags = menu.addAction(label_tags)
             act_tags.triggered.connect(_accept_tags_selected)
             menu.addSeparator()
+
+            # Avertir sur les actions de suggestion AnkiCollab présentes dans le menu pendant le diff
+            for act in menu.actions():
+                txt = act.text()
+                if "Bulk suggest" in txt or ("AnkiCollab" in txt and "Historique" not in txt):
+                    act.setToolTip("Une importation AnkiCollab est en cours de révision. Confirmez l'importation avant de suggérer.")
 
     action = menu.addAction("Historique & AnkiCollab...")
     action.triggered.connect(lambda: _show_standalone_history(browser))

@@ -4,7 +4,7 @@ import html
 import sqlite3
 import pytest
 import aqt
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Add project root to sys.path to allow absolute imports of 'src'
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2195,7 +2195,7 @@ def test_unfolded_format_apercu_rendering(mock_env):
 
 def test_editor_escape_normal_mode_closes_parent_window():
     """Verifie qu'en edition normale (pas en diff), Echap ferme la fenetre de l'editeur."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
     import src.browser_integration as bi
 
     # S'assurer qu'aucun diff n'est actif
@@ -2215,7 +2215,7 @@ def test_editor_escape_normal_mode_closes_parent_window():
 
 def test_editor_escape_normal_mode_does_not_close_mw():
     """Verifie qu'en edition normale, si la fenetre parente est mw, elle n'est pas fermee."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
     import src.browser_integration as bi
     import aqt
 
@@ -2232,7 +2232,7 @@ def test_editor_escape_normal_mode_does_not_close_mw():
 
 def test_editor_escape_diff_mode_requests_confirmation():
     """Verifie qu'en mode diff, Echap demande confirmation via le panel diff au lieu de fermer brutalement."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
     from anki_import_diff.src.savepoint import NoteDiff
     import src.browser_integration as bi
 
@@ -2259,7 +2259,7 @@ def test_editor_escape_diff_mode_requests_confirmation():
 
 def test_editor_web_shortcuts_injection_contains_escape():
     """Verifie que le script JS injecte dans la webview contient la gestion d'Echap et diff_editor_escape."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
     import src.browser_integration as bi
 
     editor = MagicMock()
@@ -2276,4 +2276,611 @@ def test_editor_web_shortcuts_injection_contains_escape():
 
 
 
+
+
+
+def _create_test_browser():
+    class FakeBrowser(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.table = QtWidgets.QWidget()
+            self.editor = MagicMock()
+            self.editor.nid = 101
+            self.form = MagicMock()
+            self.form.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+            self.form.splitter.addWidget(self.table)
+            self.form.fieldsArea = QtWidgets.QWidget()
+            self.form.splitter.addWidget(self.form.fieldsArea)
+            self.search_query = ""
+
+        def search_for(self, q):
+            self.search_query = q
+
+        def addDockWidget(self, area, widget):
+            pass
+
+    return FakeBrowser()
+
+
+def test_field_diff_panel_is_changed():
+    """Verifie la methode is_changed() sur FieldDiffPanel."""
+    from anki_import_diff.src.ui import FieldDiffPanel
+    # 1. Champ modifie
+    fp_mod = FieldDiffPanel("Recto", "Ancien texte", "Nouveau texte")
+    assert fp_mod.is_changed() is True
+
+    # 2. Champ bloque identique
+    fp_unchanged = FieldDiffPanel("Verso", "Texte identique", "Texte identique")
+    assert fp_unchanged.is_changed() is False
+
+    # 3. Champ vide
+    fp_empty = FieldDiffPanel("Remarques", "", "")
+    assert fp_empty.is_changed() is False
+
+    # 4. Difference cosmetique d'attributs HTML (guillemets)
+    fp_cosmetic = FieldDiffPanel("HTML", "<b class='x'>A</b>", '<b class="x">A</b>')
+    assert fp_cosmetic.is_changed() is False
+
+    # 5. Modification interactive par l'utilisateur
+    fp_user_mod = FieldDiffPanel("Verso", "Texte", "Texte")
+    assert fp_user_mod.is_changed() is False
+    fp_user_mod.on_editor_modified("Texte edite manuellement")
+    assert fp_user_mod.is_changed() is True
+
+
+def test_diff_browser_panel_has_pre_checked_mode():
+    """Verifie que le mode 'Champs modifies uniquement' est present et pre-coche par defaut."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=101,
+        original_fields={"Recto": "A", "Verso": "B"},
+        updated_fields={"Recto": "A modif", "Verso": "B"},
+        model_name="Basic",
+        field_names=["Recto", "Verso"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        assert hasattr(panel, "_changed_only_cb")
+        assert panel._changed_only_cb is not None
+        assert panel._changed_only_cb.isChecked() is True
+        assert panel._only_changed_fields is True
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_unchanged_fields_hidden_by_default():
+    """Verifie que les champs inchanges sont masques par defaut dans la vue diff de la note."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=202,
+        original_fields={"ChampModifie": "Old", "ChampInchange": "MemeValeur"},
+        updated_fields={"ChampModifie": "New", "ChampInchange": "MemeValeur"},
+        model_name="Basic",
+        field_names=["ChampModifie", "ChampInchange"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        panel.select_note(202)
+        note_panel = panel._note_panels[202]
+
+        fp_mod = note_panel._field_panels["ChampModifie"]
+        fp_unmod = note_panel._field_panels["ChampInchange"]
+
+        assert fp_mod.is_changed() is True
+        assert fp_unmod.is_changed() is False
+
+        assert fp_mod.isHidden() is False
+        assert fp_unmod.isHidden() is True
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_collapsible_drawer_button_toggles_unchanged_fields():
+    """Verifie que le bouton tiroir permet de deplier et replier les champs inchanges."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=303,
+        original_fields={"F1": "A", "F2": "B", "F3": "C"},
+        updated_fields={"F1": "A modif", "F2": "B", "F3": "C"},
+        model_name="Basic",
+        field_names=["F1", "F2", "F3"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        panel.select_note(303)
+        note_panel = panel._note_panels[303]
+
+        assert note_panel._unchanged_toggle_btn.isHidden() is False
+        assert "+ Afficher les 2 champs inchangés" in note_panel._unchanged_toggle_btn.text()
+
+        # Deplier les champs inchanges
+        note_panel._unchanged_toggle_btn.click()
+        assert note_panel._field_panels["F2"].isHidden() is False
+        assert note_panel._field_panels["F3"].isHidden() is False
+        assert "Masquer les 2 champs inchangés" in note_panel._unchanged_toggle_btn.text()
+
+        # Replier les champs inchanges
+        note_panel._unchanged_toggle_btn.click()
+        assert note_panel._field_panels["F2"].isHidden() is True
+        assert note_panel._field_panels["F3"].isHidden() is True
+        assert "+ Afficher les 2 champs inchangés" in note_panel._unchanged_toggle_btn.text()
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_checkbox_toggles_unchanged_fields_across_all_panels():
+    """Verifie que decocher la case principale affiche tous les champs inchanges."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=404,
+        original_fields={"F1": "A", "F2": "B"},
+        updated_fields={"F1": "A*", "F2": "B"},
+        model_name="Basic",
+        field_names=["F1", "F2"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        panel.select_note(404)
+        note_panel = panel._note_panels[404]
+
+        assert note_panel._field_panels["F2"].isHidden() is True
+
+        # Decocher la case
+        panel._changed_only_cb.setChecked(False)
+        assert note_panel._field_panels["F2"].isHidden() is False
+        assert note_panel._unchanged_toggle_btn.isHidden() is True
+
+        # Recocher la case
+        panel._changed_only_cb.setChecked(True)
+        assert note_panel._field_panels["F2"].isHidden() is True
+        assert note_panel._unchanged_toggle_btn.isHidden() is False
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_all_fields_unchanged_displays_informative_message():
+    """Verifie le message informatif si aucun champ texte n'est modifie (par exemple diff de tags uniquement)."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=505,
+        original_fields={"F1": "A"},
+        updated_fields={"F1": "A"},
+        model_name="Basic",
+        field_names=["F1"],
+        tags=["new_tag"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        panel.select_note(505)
+        note_panel = panel._note_panels[505]
+
+        assert note_panel._field_panels["F1"].isHidden() is True
+        assert note_panel._no_fields_changed_lbl.isHidden() is False
+        assert "+ Afficher le champ inchangé" in note_panel._unchanged_toggle_btn.text()
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_editor_edit_reveals_unchanged_field():
+    """Verifie qu'une modification dans l'editeur rend le champ immediatement visible."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=707,
+        original_fields={"A": "Modifie", "B": "Initial"},
+        updated_fields={"A": "Import", "B": "Initial"},
+        model_name="Basic",
+        field_names=["A", "B"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        panel.select_note(707)
+        note_panel = panel._note_panels[707]
+
+        assert note_panel._field_panels["B"].isHidden() is True
+
+        note_panel._on_field_edited_by_user("B", "Nouvelle saisie")
+        assert note_panel._field_panels["B"].isHidden() is False
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_persistence_of_only_changed_setting(tmp_path, monkeypatch):
+    """Verifie que le choix de l'utilisateur est persiste et recharge."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs, _save_browser_state, _load_browser_layout_state
+    layout_file = str(tmp_path / "browser_diff_layout.json")
+    monkeypatch.setattr("anki_import_diff.src.browser_integration._get_layout_file_path", lambda: layout_file)
+
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=808,
+        original_fields={"A": "1"},
+        updated_fields={"A": "2"},
+        model_name="Basic",
+        field_names=["A"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        panel._changed_only_cb.setChecked(False)
+        _save_browser_state(browser)
+
+        state = _load_browser_layout_state()
+        assert state.get("only_changed_fields") is False
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_is_note_learned_and_get_learned_note_ids():
+    """Verifie la detection des cartes deja apprises au niveau base de donnees / collection."""
+    from anki_import_diff.src.savepoint import is_note_learned, get_learned_note_ids
+    db = MockAnkiDB()
+    col = MockCollection(db)
+
+    # Note 101 : Carte neuve jamais apprise (reps=0, type=0, queue=0)
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (1, 101, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')"
+    )
+    # Note 202 : Carte apprise en revue (type=2, reps=5, queue=2)
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (2, 202, 1, 0, 0, 0, 2, 2, 0, 10, 2500, 5, 0, 0, 0, 0, 0, '')"
+    )
+    # Note 303 : Carte en cours d'apprentissage (type=1, queue=1, reps=1)
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (3, 303, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, '')"
+    )
+    # Note 404 : Carte en reapprentissage (type=3, queue=3, reps=8)
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (4, 404, 1, 0, 0, 0, 3, 3, 0, 1, 0, 8, 1, 0, 0, 0, 0, '')"
+    )
+
+    assert is_note_learned(101, col) is False
+    assert is_note_learned(202, col) is True
+    assert is_note_learned(303, col) is True
+    assert is_note_learned(404, col) is True
+    assert is_note_learned(999, col) is False
+    assert is_note_learned(0, col) is False
+    assert is_note_learned(-1, col) is False
+
+    learned_set = get_learned_note_ids([101, 202, 303, 404, 999], col)
+    assert learned_set == {202, 303, 404}
+
+
+def test_learned_cards_filter_native_default_disabled():
+    """Verifie que l'option de filtrage des cartes apprises est nativement desactivee par defaut."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=101,
+        original_fields={"Recto": "A"},
+        updated_fields={"Recto": "B"},
+        model_name="Basic",
+        field_names=["Recto"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        assert hasattr(panel, "_btn_learned_only")
+        assert panel._btn_learned_only is not None
+        assert panel._btn_learned_only.isChecked() is False
+        assert panel._learned_cards_only is False
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_toggle_learned_cards_filter_in_browser():
+    """Verifie le fonctionnement du bouton de filtrage des cartes apprises dans le menu lateral."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    db = MockAnkiDB()
+    col = MockCollection(db)
+    # 101 non apprise, 202 apprise
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (1, 101, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')"
+    )
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (2, 202, 1, 0, 0, 0, 2, 2, 0, 10, 2500, 5, 0, 0, 0, 0, 0, '')"
+    )
+
+    browser = _create_test_browser()
+    browser.col = col
+
+    diff1 = NoteDiff(
+        note_id=101,
+        original_fields={"Recto": "A1"},
+        updated_fields={"Recto": "A2"},
+        model_name="Basic",
+        field_names=["Recto"],
+        action="UPDATE",
+    )
+    diff2 = NoteDiff(
+        note_id=202,
+        original_fields={"Recto": "B1"},
+        updated_fields={"Recto": "B2"},
+        model_name="Basic",
+        field_names=["Recto"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff1, diff2], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        # Bouton affiche le nombre de cartes apprises parmi les diffs
+        assert "Cartes déjà apprises (1)" in panel._btn_learned_only.text()
+        assert panel._learned_cards_only is False
+
+        # Activer le filtre
+        panel._btn_learned_only.setChecked(True)
+        assert panel._learned_cards_only is True
+        assert browser.search_query == "nid:202"
+        assert panel._current_nid == 202
+        assert "Filtre : cartes apprises" in panel._status_lbl.text()
+
+        # Desactiver le filtre
+        panel._btn_learned_only.setChecked(False)
+        assert panel._learned_cards_only is False
+        assert browser.search_query == "nid:101,202"
+        assert "Filtre : cartes apprises" not in panel._status_lbl.text()
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_learned_cards_filter_with_zero_learned_cards():
+    """Verifie le comportement lorsqu'aucune carte du diff n'a encore ete apprise."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs
+    db = MockAnkiDB()
+    col = MockCollection(db)
+    # Deux notes non apprises
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (1, 101, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')"
+    )
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (2, 102, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')"
+    )
+
+    browser = _create_test_browser()
+    browser.col = col
+
+    diff1 = NoteDiff(note_id=101, original_fields={"A": "1"}, updated_fields={"A": "2"}, model_name="B", field_names=["A"], action="UPDATE")
+    diff2 = NoteDiff(note_id=102, original_fields={"A": "1"}, updated_fields={"A": "2"}, model_name="B", field_names=["A"], action="UPDATE")
+    set_pending_diffs([diff1, diff2], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        assert "Cartes déjà apprises (0)" in panel._btn_learned_only.text()
+
+        # Activer le filtre
+        panel._btn_learned_only.setChecked(True)
+        assert browser.search_query == "nid:0"
+        assert panel._diff_stack.currentWidget() == panel._no_learned_widget
+
+        # Cliquer sur le bouton pour reafficher toutes les modifications
+        no_learned_btn = panel._no_learned_widget.findChild(QtWidgets.QPushButton)
+        assert no_learned_btn is not None
+        no_learned_btn.click()
+
+        assert panel._btn_learned_only.isChecked() is False
+        assert browser.search_query == "nid:101,102"
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_learned_cards_filter_persistence(tmp_path, monkeypatch):
+    """Verifie que l'etat du filtre cartes deja apprises est persiste et recharge."""
+    from anki_import_diff.src.browser_integration import DiffBrowserPanel, NoteDiff, set_pending_diffs, clear_pending_diffs, _save_browser_state, _load_browser_layout_state
+    layout_file = str(tmp_path / "browser_diff_layout.json")
+    monkeypatch.setattr("anki_import_diff.src.browser_integration._get_layout_file_path", lambda: layout_file)
+
+    browser = _create_test_browser()
+    diff = NoteDiff(
+        note_id=909,
+        original_fields={"A": "1"},
+        updated_fields={"A": "2"},
+        model_name="Basic",
+        field_names=["A"],
+        action="UPDATE",
+    )
+    set_pending_diffs([diff], lambda x: None)
+
+    panel = None
+    try:
+        panel = DiffBrowserPanel(browser)
+        panel._btn_learned_only.setChecked(True)
+        _save_browser_state(browser)
+
+        state = _load_browser_layout_state()
+        assert state.get("learned_cards_only") is True
+    finally:
+        if panel is not None:
+            panel.cleanup()
+        clear_pending_diffs()
+
+
+def test_visual_diff_dialog_learned_filter(monkeypatch):
+    """Verifie le filtre des cartes apprises dans VisualDiffDialog."""
+    from anki_import_diff.src.ui import VisualDiffDialog
+    from anki_import_diff.src.savepoint import NoteDiff
+    import aqt
+    db = MockAnkiDB()
+    col = MockCollection(db)
+    # Note 101 non apprise, 202 apprise
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (1, 101, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')"
+    )
+    db.execute(
+        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) "
+        "VALUES (2, 202, 1, 0, 0, 0, 2, 2, 0, 10, 2500, 5, 0, 0, 0, 0, 0, '')"
+    )
+    monkeypatch.setattr(aqt.mw, "col", col)
+
+    diff1 = NoteDiff(note_id=101, original_fields={"A": "1"}, updated_fields={"A": "2"}, model_name="B", field_names=["A"], action="UPDATE")
+    diff2 = NoteDiff(note_id=202, original_fields={"A": "1"}, updated_fields={"A": "2"}, model_name="B", field_names=["A"], action="UPDATE")
+
+    dlg = VisualDiffDialog([diff1, diff2])
+    try:
+        assert "learned" in dlg._filter_btns
+        assert dlg._list.count() == 2
+
+        # Activer le filtre 'learned'
+        dlg._set_filter("learned")
+        assert dlg._list.count() == 1
+        item_note = dlg._list.item(0).data(QtCore.Qt.ItemDataRole.UserRole)
+        assert item_note.note_id == 202
+    finally:
+        dlg.close()
+
+
+def test_field_diff_panel_partial_hunk_selection():
+    """Verifie le calcul et le statut de get_merged_value lors d'une selection partielle de hunks."""
+    from anki_import_diff.src.ui import FieldDiffPanel
+    from anki_import_diff.src.savepoint import NoteDiff
+
+    diff = NoteDiff(
+        note_id=999,
+        original_fields={"F1": "Line 1 old\nLine 2 old"},
+        updated_fields={"F1": "Line 1 new\nLine 2 new"},
+        model_name="Basic",
+        field_names=["F1"],
+        action="UPDATE",
+    )
+    fp = FieldDiffPanel("F1", "Line 1 old\nLine 2 old", "Line 1 new\nLine 2 new", diff=diff)
+    assert len(fp.hunks) == 2
+
+    # Accepter le premier hunk, rejeter le second
+    fp.hunks[0].accepted = True
+    fp.hunks[1].accepted = False
+    fp._on_hunk_state_changed()
+
+    assert fp.active_target == "PARTIAL"
+    assert "Sélection partielle" in fp._badge.text()
+    merged = fp.get_merged_value()
+    assert "Line 1 new" in merged
+    assert "Line 2 old" in merged
+    assert diff.merged_fields["F1"] == merged
+
+    # Basculer vers accepter tout
+    fp._btn_accept_all.click()
+    assert fp.active_target == "PROP"
+    assert fp.get_merged_value() == "Line 1 new\nLine 2 new"
+
+    # Basculer vers rejeter tout
+    fp._btn_reject_all.click()
+    assert fp.active_target == "OLD"
+    assert fp.get_merged_value() == "Line 1 old\nLine 2 old"
+
+
+def test_editor_bridge_accept_tags_only():
+    """Verifie que la commande bridge diff_accept_tags_only est bien interceptee."""
+    from anki_import_diff.src.browser_integration import _on_editor_did_init
+
+    editor = MagicMock()
+    original_bridge = MagicMock()
+    editor.onBridgeCmd = original_bridge
+    editor.web = MagicMock()
+
+    _on_editor_did_init(editor)
+    patched = editor.onBridgeCmd
+
+    # diff_accept_tags_only doit etre intercepte et ne pas appeler original_bridge
+    with patch("anki_import_diff.src.browser_integration._handle_editor_bridge") as mock_handle:
+        patched("diff_accept_tags_only")
+        mock_handle.assert_called_once_with(editor, "diff_accept_tags_only")
+        original_bridge.assert_not_called()
+
+    # Une commande inconnue doit tomber dans original_bridge
+    original_bridge.reset_mock()
+    patched("other_cmd")
+    original_bridge.assert_called_once_with("other_cmd")
+
+
+def test_note_diff_panel_with_sync_queries_protected_db(monkeypatch):
+    """Verifie que NoteDiffPanelWithSync charge les champs proteges depuis ProtectedFieldsDB."""
+    from anki_import_diff.src.browser_integration import NoteDiffPanelWithSync, DiffBrowserPanel
+    from anki_import_diff.src.savepoint import NoteDiff
+    from anki_import_diff.src.history import ProtectedFieldsDB
+
+    mock_pdb = MagicMock()
+    mock_pdb.get_all_protected.return_value = {"F1": "user"}
+    monkeypatch.setattr(ProtectedFieldsDB, "instance", classmethod(lambda cls: mock_pdb))
+
+    diff = NoteDiff(
+        note_id=888,
+        original_fields={"F1": "Old1", "F2": "Old2"},
+        updated_fields={"F1": "New1", "F2": "New2"},
+        model_name="Basic",
+        field_names=["F1", "F2"],
+        action="UPDATE",
+    )
+    bp = MagicMock(spec=DiffBrowserPanel)
+    bp._only_changed_fields = False
+
+    panel = NoteDiffPanelWithSync(diff, bp)
+    assert panel._field_panels["F1"]._protected is True
+    assert panel._field_panels["F2"]._protected is False
+    assert panel._field_panels["F1"].get_merged_value() == "Old1"
 

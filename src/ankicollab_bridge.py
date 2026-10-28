@@ -258,9 +258,9 @@ class AnkiCollabBridge:
             if _mw is None or _mw.col is None:
                 return None
 
-            # Récupérer le did (deck id) de la première carte via SQL
+            # Récupérer le did (deck id canonique) de la première carte via SQL
             did = _mw.col.db.scalar(
-                "SELECT did FROM cards WHERE nid = ? LIMIT 1", note_id
+                "SELECT CASE WHEN odid > 0 THEN odid ELSE did END FROM cards WHERE nid = ? LIMIT 1", note_id
             )
             if did is None:
                 return None

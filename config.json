@@ -1,5 +1,8 @@
 {
-  "visual_diff_enabled": false,
+  "visual_diff_enabled": true,
+  "ankicollab_diff_enabled": true,
+  "only_changed_fields": true,
+  "learned_cards_only": false,
   "browser_diff_state": {
     "main_splitter_sizes": [260, 740],
     "editor_diff_sizes": [480, 260]

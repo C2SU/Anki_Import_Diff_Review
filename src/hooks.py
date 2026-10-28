@@ -201,6 +201,13 @@ def setup_hooks() -> None:
     install_js_console_filter()
     is_visual_diff_enabled()
 
+    # Register AnkiCollab update interception hook
+    try:
+        from .ankicollab_hook import setup_ankicollab_hook
+        setup_ankicollab_hook()
+    except Exception as e:
+        print("[anki-diff] setup_ankicollab_hook error:", e)
+
     # Register editor + browser native integration hooks (always active)
     try:
         setup_native_integration()
@@ -255,6 +262,13 @@ def _on_profile_did_open() -> None:
         print("[anki-diff] NoteHistoryDB instance reset on profile open")
     except Exception as e:
         print("[anki-diff] Failed to reset NoteHistoryDB instance:", e)
+
+    try:
+        from .ankicollab_hook import setup_ankicollab_hook, setup_tools_menu
+        setup_ankicollab_hook()
+        setup_tools_menu()
+    except Exception as e:
+        print("[anki-diff] setup_ankicollab_hook on profile open error:", e)
 
 
 def _on_profile_will_close() -> None:
@@ -1220,6 +1234,13 @@ def _save_history_before_bulk(col, notes) -> None:
       - Stack contenant anki_import_diff (import diff lui-même écrit)
     """
     import sys
+
+    try:
+        from .ankicollab_hook import is_in_collab_dry_run
+        if is_in_collab_dry_run():
+            return
+    except Exception:
+        pass
 
     try:
         from .history import NoteHistoryDB

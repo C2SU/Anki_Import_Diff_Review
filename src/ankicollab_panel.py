@@ -941,6 +941,10 @@ class AnkiCollabHistoryPanel(QtWidgets.QWidget):
         self._render_mode = self._render_mode_combo.currentData() or "diff"
         self._render_comparison_view()
 
+    def _refresh_fields_preview(self):
+        """Rafraîchit l'affichage comparatif des champs."""
+        self._render_comparison_view()
+
     def _render_comparison_view(self):
         # Vider les cartes actuelles
         layout = self._cards_layout

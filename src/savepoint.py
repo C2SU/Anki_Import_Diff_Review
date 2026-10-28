@@ -42,6 +42,112 @@ class SavepointManager:
 
 _import_lock = threading.Lock()
 
+
+def _db_scalar(db: Any, sql: str, *args) -> Any:
+    if hasattr(db, "scalar"):
+        return db.scalar(sql, *args)
+    elif hasattr(db, "all"):
+        rows = db.all(sql, *args)
+        if rows:
+            first_row = rows[0]
+            if isinstance(first_row, dict):
+                return next(iter(first_row.values()))
+            elif isinstance(first_row, (list, tuple)):
+                return first_row[0]
+            return first_row
+        return None
+    elif hasattr(db, "execute"):
+        cursor = db.execute(sql, *args)
+        row = cursor.fetchone()
+        return row[0] if row else None
+    return None
+
+
+def _db_list(db: Any, sql: str, *args) -> List[Any]:
+    if hasattr(db, "list"):
+        return db.list(sql, *args)
+    elif hasattr(db, "all"):
+        rows = db.all(sql, *args)
+        results = []
+        for r in rows:
+            if isinstance(r, dict):
+                results.append(next(iter(r.values())))
+            elif isinstance(r, (list, tuple)):
+                results.append(r[0])
+            else:
+                results.append(r)
+        return results
+    elif hasattr(db, "execute"):
+        cursor = db.execute(sql, *args)
+        return [r[0] for r in cursor.fetchall()]
+    return []
+
+
+def is_note_learned(nid: int, col: Any = None) -> bool:
+    """Retourne True si la note possède au moins une carte déjà apprise (reps > 0, type != 0 ou queue in (1,2,3))."""
+    if not nid or nid <= 0:
+        return False
+    if col is None:
+        col = getattr(aqt.mw, "col", None)
+    if col is None:
+        return False
+    try:
+        db = getattr(col, "db", None)
+        if db is not None:
+            val = _db_scalar(
+                db,
+                "SELECT 1 FROM cards WHERE nid = ? AND (type != 0 OR reps > 0 OR queue IN (1, 2, 3)) LIMIT 1",
+                nid,
+            )
+            if val:
+                return True
+        if hasattr(col, "find_notes"):
+            matched = col.find_notes(f"nid:{nid} -is:new")
+            if matched and nid in matched:
+                return True
+        if hasattr(col, "get_note"):
+            try:
+                note = col.get_note(nid)
+                if note and hasattr(note, "cards"):
+                    for c in note.cards():
+                        if getattr(c, "reps", 0) > 0 or getattr(c, "type", 0) != 0 or getattr(c, "queue", 0) in (1, 2, 3):
+                            return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def get_learned_note_ids(nids: List[int], col: Any = None) -> set:
+    """Retourne l'ensemble des IDs de notes parmi 'nids' possédant au moins une carte apprise."""
+    if not nids:
+        return set()
+    if col is None:
+        col = getattr(aqt.mw, "col", None)
+    if col is None:
+        return set()
+    learned = set()
+    try:
+        db = getattr(col, "db", None)
+        if db is not None:
+            placeholders = ",".join("?" for _ in nids)
+            rows = _db_list(
+                db,
+                f"SELECT DISTINCT nid FROM cards WHERE nid IN ({placeholders}) AND (type != 0 OR reps > 0 OR queue IN (1, 2, 3))",
+                *nids,
+            )
+            learned.update(rows)
+            return learned
+    except Exception:
+        pass
+
+    for nid in nids:
+        if is_note_learned(nid, col):
+            learned.add(nid)
+    return learned
+
+
 @dataclass
 class NoteDiff:
     note_id: int
@@ -308,7 +414,7 @@ def capture_import_changes(import_fn: Callable[..., Any], *args: Any, **kwargs: 
                     diff_deck_id = 0
                     if action == 'INSERT':
                         try:
-                            deck_rows = db.all(f"SELECT did FROM cards WHERE nid = {nid} LIMIT 1")
+                            deck_rows = db.all("SELECT CASE WHEN odid > 0 THEN odid ELSE did END as did FROM cards WHERE nid = ? LIMIT 1", nid)
                             if deck_rows:
                                 did_val = _row_get(deck_rows[0], 0, "did")
                                 if did_val is not None:

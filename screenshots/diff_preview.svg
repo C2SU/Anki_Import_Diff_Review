@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" width="100%" height="100%">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .window { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 8px; }
+      .header { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1; }
+      .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; font-weight: 600; fill: #334155; }
+      .badge-test { fill: #fef2f2; stroke: #fca5a5; stroke-width: 1; rx: 4px; }
+      .badge-test-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; font-weight: 700; fill: #b91c1c; }
+      .section-label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 700; fill: #475569; }
+      .card-box { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1; rx: 6px; }
+      .field-label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; font-weight: 600; fill: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }
+      .text-base { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; fill: #1e293b; line-height: 1.5; }
+      .del-box { fill: #fee2e2; stroke: #fca5a5; stroke-width: 0.75; rx: 3px; }
+      .del-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; fill: #991b1b; text-decoration: line-through; }
+      .ins-box { fill: #dcfce7; stroke: #86efac; stroke-width: 0.75; rx: 3px; }
+      .ins-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; font-weight: 600; fill: #166534; }
+      .btn { rx: 4px; stroke-width: 1; cursor: pointer; }
+      .btn-accept { fill: #f0fdf4; stroke: #86efac; }
+      .btn-accept-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; font-weight: 600; fill: #15803d; }
+      .btn-reject { fill: #fef2f2; stroke: #fca5a5; }
+      .btn-reject-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; font-weight: 600; fill: #b91c1c; }
+      .btn-primary { fill: #2563eb; stroke: #1d4ed8; }
+      .btn-primary-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #ffffff; }
+      .btn-secondary { fill: #ffffff; stroke: #cbd5e1; }
+      .btn-secondary-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #475569; }
+      .btn-edit { fill: #f8fafc; stroke: #cbd5e1; }
+      .btn-edit-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; font-weight: 600; fill: #475569; }
+      .sidebar { fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1; }
+      .sidebar-item { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #334155; }
+      .sidebar-item-active { fill: #eff6ff; stroke: #bfdbfe; stroke-width: 1; rx: 4px; }
+      .sidebar-item-active-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #1d4ed8; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="100%" height="100%" class="bg" />
+
+  <!-- Window Container -->
+  <g transform="translate(20, 15)">
+    <rect width="760" height="450" class="window" />
+    
+    <!-- Window Header -->
+    <path d="M 0 8 Q 0 0 8 0 L 752 0 Q 760 0 760 8 L 760 36 L 0 36 Z" class="header" />
+    <circle cx="16" cy="18" r="5" fill="#f87171" />
+    <circle cx="32" cy="18" r="5" fill="#fbbf24" />
+    <circle cx="48" cy="18" r="5" fill="#4ade80" />
+    <text x="70" y="22" class="title">Revue des differences avant importation - Visual Diff Hunk</text>
+    
+    <!-- Test Badge in Header -->
+    <rect x="640" y="8" width="105" height="20" class="badge-test" />
+    <text x="648" y="22" class="badge-test-text">VERSION DE TEST</text>
+
+    <!-- Sidebar (Notes List) -->
+    <rect x="0" y="36" width="220" height="364" class="sidebar" />
+    <text x="14" y="60" class="section-label">Cartes modifiees (3)</text>
+    
+    <!-- Note Item 1 (Active) -->
+    <rect x="10" y="74" width="200" height="42" class="sidebar-item-active" />
+    <text x="20" y="92" class="sidebar-item-active-text">Item 228 - Douleur thoracique</text>
+    <text x="20" y="106" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10px" fill="#64748b">2 champs modifies</text>
+
+    <!-- Note Item 2 -->
+    <text x="20" y="136" class="sidebar-item">Item 334 - AVC ischemique</text>
+    <text x="20" y="150" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10px" fill="#94a3b8">1 champ modifie</text>
+
+    <!-- Note Item 3 -->
+    <text x="20" y="180" class="sidebar-item">Item 156 - Arthrose de hanche</text>
+    <text x="20" y="194" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10px" fill="#94a3b8">Tags ajoutes</text>
+
+    <!-- Main Content Area -->
+    <g transform="translate(235, 46)">
+      <!-- Note Header -->
+      <text x="5" y="18" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="15px" font-weight="700" fill="#0f172a">Item 228 : Examen de premiere intention</text>
+      <text x="5" y="34" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11px" fill="#64748b">Modele : Basique-EDN-Picat | Paquet : EDN::Cardiologie</text>
+
+      <!-- Field 1 Box -->
+      <g transform="translate(0, 46)">
+        <rect width="510" height="110" class="card-box" />
+        <text x="12" y="20" class="field-label">Champ : Recto (Question)</text>
+        
+        <!-- Controls for Field 1 -->
+        <rect x="360" y="8" width="65" height="20" class="btn btn-accept" />
+        <text x="370" y="22" class="btn-accept-text">Accepter</text>
+        <rect x="432" y="8" width="65" height="20" class="btn btn-reject" />
+        <text x="444" y="22" class="btn-reject-text">Rejeter</text>
+
+        <!-- Diff Text Field 1 -->
+        <text x="12" y="48" class="text-base">Devant une douleur thoracique aigue suspecte de SCA :</text>
+        
+        <!-- Deletion -->
+        <rect x="12" y="58" width="135" height="22" class="del-box" />
+        <text x="16" y="73" class="del-text">examen sous 30 min</text>
+        
+        <!-- Addition -->
+        <rect x="155" y="58" width="195" height="22" class="ins-box" />
+        <text x="160" y="73" class="ins-text">ECG 12D dans les 10 minutes</text>
+        
+        <text x="12" y="98" class="text-base">quel est l'acte diagnostique initial immediat ?</text>
+      </g>
+
+      <!-- Field 2 Box -->
+      <g transform="translate(0, 166)">
+        <rect width="510" height="120" class="card-box" />
+        <text x="12" y="20" class="field-label">Champ : Verso (Reponse detaillee)</text>
+        
+        <!-- Controls for Field 2 -->
+        <rect x="360" y="8" width="65" height="20" class="btn btn-accept" />
+        <text x="370" y="22" class="btn-accept-text">Accepter</text>
+        <rect x="432" y="8" width="65" height="20" class="btn btn-reject" />
+        <text x="444" y="22" class="btn-reject-text">Rejeter</text>
+
+        <!-- Diff Text Field 2 -->
+        <text x="12" y="48" class="text-base">ECG 12 derivations de repos complet</text>
+        
+        <!-- Addition -->
+        <rect x="12" y="58" width="370" height="22" class="ins-box" />
+        <text x="16" y="73" class="ins-text">+ derivations complementaires V7, V8, V9 et V3R, V4R</text>
+        
+        <text x="12" y="98" class="text-base">Recherche d'un sus-decalage du segment ST persistant.</text>
+      </g>
+
+      <!-- Bulk Actions for current note -->
+      <g transform="translate(0, 296)">
+        <rect x="0" y="0" width="125" height="24" class="btn btn-edit" />
+        <text x="10" y="16" class="btn-edit-text">Modifier le texte (&lt;&gt;)</text>
+        
+        <rect x="290" y="0" width="105" height="24" class="btn btn-accept" />
+        <text x="302" y="16" class="btn-accept-text">Tout accepter</text>
+
+        <rect x="405" y="0" width="105" height="24" class="btn btn-reject" />
+        <text x="419" y="16" class="btn-reject-text">Tout rejeter</text>
+      </g>
+    </g>
+
+    <!-- Bottom Action Bar -->
+    <line x1="0" y1="400" x2="760" y2="400" stroke="#cbd5e1" stroke-width="1" />
+    <rect x="0" y="400" width="760" height="50" fill="#f8fafc" />
+    
+    <!-- Summary info -->
+    <text x="16" y="430" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12px" fill="#475569">
+      Progression : 3 notes a examiner | 2 acceptees, 1 en attente
+    </text>
+
+    <!-- Bottom Dialog Buttons -->
+    <rect x="450" y="412" width="140" height="28" class="btn btn-secondary" />
+    <text x="464" y="430" class="btn-secondary-text">Annuler sans modifier</text>
+
+    <rect x="600" y="412" width="145" height="28" class="btn btn-primary" />
+    <text x="612" y="430" class="btn-primary-text">Confirmer l'importation</text>
+  </g>
+</svg>

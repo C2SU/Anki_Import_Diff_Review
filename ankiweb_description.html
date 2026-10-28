@@ -1,0 +1,153 @@
+<h1>Anki Import Diff Review &amp; AnkiCollab History (Version Test)</h1>
+
+<p style="font-size: 15px; color: #334155; line-height: 1.6;">
+  <b>Ne perdez plus jamais vos notes personnelles lors d'une mise a jour !</b><br>
+  Par defaut dans Anki, importer un paquet ou synchroniser un deck collaboratif ecrase vos cartes a l'aveugle. 
+  Cet add-on cree un <b>sas de securite</b> : il compare vos cartes existantes avec les nouvelles, vous montre exactement ce qui a change avec un surlignage visuel (rouge/vert), et vous laisse choisir ce que vous gardez.
+</p>
+
+<!-- Encadre Avertissement Version Test -->
+<div style="background-color: #fff1f2; border: 1px solid #fecdd3; border-left: 4px solid #e11d48; padding: 14px 18px; margin: 20px 0; border-radius: 4px; color: #881337; line-height: 1.5;">
+  <strong style="text-transform: uppercase; letter-spacing: 0.5px; font-size: 12px;">Avertissement obligatoire - Version de test active :</strong><br>
+  <span style="font-size: 13px;">
+    Cet add-on est en cours de developpement et de test. Comme il supervise l'enregistrement de vos cartes lors des imports, vous devez comprendre son fonctionnement et <b>toujours exporter une sauvegarde complete de votre profil Anki (.colpkg)</b> avant de traiter un paquet volumineux.
+  </span>
+</div>
+
+<hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+<h2>Comment ca fonctionne en 4 etapes ?</h2>
+
+<!-- Mockup Schema Flux 4 Etapes (HTML pur sobre) -->
+<table style="width: 100%; border-collapse: separate; border-spacing: 10px; margin: 15px 0;">
+  <tr>
+    <td style="width: 25%; vertical-align: top; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 12px;">
+      <div style="font-size: 11px; font-weight: 700; color: #2563eb; margin-bottom: 4px;">ETAPE 1</div>
+      <div style="font-weight: 700; font-size: 13px; color: #0f172a; margin-bottom: 6px;">Import ou Synchro</div>
+      <div style="font-size: 12px; color: #475569; line-height: 1.4;">Vous lancez l'importation d'un paquet (.apkg / .csv) ou une synchronisation AnkiCollab.</div>
+    </td>
+    <td style="width: 25%; vertical-align: top; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 12px;">
+      <div style="font-size: 11px; font-weight: 700; color: #2563eb; margin-bottom: 4px;">ETAPE 2</div>
+      <div style="font-weight: 700; font-size: 13px; color: #0f172a; margin-bottom: 6px;">Sas de Securite</div>
+      <div style="font-size: 12px; color: #475569; line-height: 1.4;">L'extension teste l'importation dans un espace isole. Votre collection reelle n'est pas modifiee.</div>
+    </td>
+    <td style="width: 25%; vertical-align: top; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 12px;">
+      <div style="font-size: 11px; font-weight: 700; color: #2563eb; margin-bottom: 4px;">ETAPE 3</div>
+      <div style="font-weight: 700; font-size: 13px; color: #0f172a; margin-bottom: 6px;">Revue Visuelle</div>
+      <div style="font-size: 12px; color: #475569; line-height: 1.4;">Une fenetre s'ouvre : le texte supprime est en rouge, les nouveautes en vert. Vous cochez ce qui vous convient.</div>
+    </td>
+    <td style="width: 25%; vertical-align: top; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 12px;">
+      <div style="font-size: 11px; font-weight: 700; color: #2563eb; margin-bottom: 4px;">ETAPE 4</div>
+      <div style="font-weight: 700; font-size: 13px; color: #0f172a; margin-bottom: 6px;">Validation Finale</div>
+      <div style="font-size: 12px; color: #475569; line-height: 1.4;">Seules les modifications que vous avez validees sont enregistrees. Si vous annulez : zero changement.</div>
+    </td>
+  </tr>
+</table>
+
+<hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+<h2>Illustration : Ce que vous voyez a l'ecran</h2>
+<p style="font-size: 13px; color: #475569;">
+  Voici a quoi ressemble la fenetre de comparaison lorsque de nouvelles informations arrivent sur l'une de vos cartes :
+</p>
+
+<!-- Maquette Visuelle Realiste de la Boite de Dialogue Diff -->
+<div style="background-color: #ffffff; border: 1.5px solid #cbd5e1; border-radius: 8px; overflow: hidden; margin: 18px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+  
+  <!-- En-tete de la fenetre -->
+  <div style="background: #f1f5f9; padding: 10px 16px; border-bottom: 1px solid #cbd5e1; display: flex; justify-content: space-between; align-items: center;">
+    <span style="font-size: 13px; font-weight: 700; color: #334155;">Fenetre de revue - Carte 1 sur 3 modifiees</span>
+    <span style="font-size: 11px; font-weight: 600; background: #e0f2fe; color: #0369a1; padding: 2px 8px; border-radius: 4px; border: 1px solid #bae6fd;">Paquet : EDN::Cardiologie</span>
+  </div>
+
+  <!-- Corps de la carte -->
+  <div style="padding: 16px; background: #ffffff;">
+    <div style="font-size: 15px; font-weight: 700; color: #0f172a; margin-bottom: 14px;">
+      Item 228 - Douleur thoracique aigue
+    </div>
+
+    <!-- Champ Recto -->
+    <div style="border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; margin-bottom: 14px; background: #ffffff;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Champ : Recto (Enonce)</span>
+        <div>
+          <span style="display: inline-block; padding: 3px 10px; font-size: 11px; font-weight: 600; color: #15803d; background: #f0fdf4; border: 1px solid #86efac; border-radius: 4px; margin-right: 6px;">Conserver cette modification</span>
+          <span style="display: inline-block; padding: 3px 10px; font-size: 11px; font-weight: 600; color: #64748b; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 4px;">Refuser</span>
+        </div>
+      </div>
+      <div style="font-size: 13px; color: #1e293b; line-height: 1.6;">
+        Devant une suspicion de syndrome coronarien aigu, quel examen doit etre realise 
+        <span style="background-color: #fee2e2; color: #991b1b; text-decoration: line-through; padding: 2px 6px; border-radius: 3px; border: 1px solid #fca5a5;">sous 30 minutes</span> 
+        <span style="background-color: #dcfce7; color: #166534; font-weight: 600; padding: 2px 6px; border-radius: 3px; border: 1px solid #86efac;">dans les 10 minutes</span> ?
+      </div>
+    </div>
+
+    <!-- Champ Verso -->
+    <div style="border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; background: #ffffff;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Champ : Verso (Reponse)</span>
+        <div>
+          <span style="display: inline-block; padding: 3px 10px; font-size: 11px; font-weight: 600; color: #15803d; background: #f0fdf4; border: 1px solid #86efac; border-radius: 4px; margin-right: 6px;">Conserver cette modification</span>
+          <span style="display: inline-block; padding: 3px 10px; font-size: 11px; font-weight: 600; color: #64748b; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 4px;">Refuser</span>
+        </div>
+      </div>
+      <div style="font-size: 13px; color: #1e293b; line-height: 1.6;">
+        ECG 12 derivations de repos complet
+        <span style="background-color: #dcfce7; color: #166534; font-weight: 600; padding: 2px 6px; border-radius: 3px; border: 1px solid #86efac;">+ derivations complementaires V7, V8, V9 et V3R, V4R</span>.
+      </div>
+    </div>
+  </div>
+
+  <!-- Pied de fenetre -->
+  <div style="background: #f8fafc; padding: 12px 16px; border-top: 1px solid #cbd5e1; display: flex; justify-content: space-between; align-items: center;">
+    <span style="font-size: 12px; color: #64748b;">Astuce : Vous pouvez aussi corriger manuellement le texte avant de valider.</span>
+    <div>
+      <span style="display: inline-block; padding: 6px 14px; font-size: 12px; font-weight: 600; color: #475569; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 4px; margin-right: 8px;">Annuler (Ne rien modifier)</span>
+      <span style="display: inline-block; padding: 6px 14px; font-size: 12px; font-weight: 600; color: #ffffff; background: #2563eb; border: 1px solid #1d4ed8; border-radius: 4px;">Appliquer les modifications</span>
+    </div>
+  </div>
+</div>
+
+<hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+<h2>Ce que cet add-on vous apporte concretement</h2>
+<ul>
+  <li><b>Fini la peur d'importer :</b> Vous ne risquez plus de voir vos propres remarques ou moyens mnemotechniques effaces sans vous en rendre compte.</li>
+  <li><b>Selection au choix :</b> Vous pouvez accepter la mise a jour de la question mais refuser la modification de la reponse si vous aviez deja une formule qui vous convenait.</li>
+  <li><b>Historique dans le Navigateur (Parcourir) :</b> Un volet lateral s'ajoute a la fenetre Parcourir pour vous indiquer en permanence ce qui a change sur vos cartes au fil des versions, avec des filtres pour n'afficher que les cartes que vous etes deja en train d'apprendre.</li>
+</ul>
+
+<hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+<h2>Quels sont les risques reels et que faire pour les eviter ?</h2>
+<ul>
+  <li><b>Risque 1 : Cliquer sur &quot;Tout accepter&quot; sans regarder.</b><br>
+  Si vous validez l'ensemble du paquet sans examiner les cartes, vos modifications personnelles seront remplacees par le contenu du fichier importe. Prenez quelques secondes pour parcourir la liste.</li>
+  
+  <li><b>Risque 2 : Desynchronisation avec AnkiCollab.</b><br>
+  Si vous refusez une modification officielle proposee par le deck collaboratif de votre universite ou promo, votre carte restera dans votre version. Lors de la mise a jour suivante, AnkiCollab vous reproposera la meme modification.</li>
+
+  <li><b>Risque 3 : Coupure d'Anki pendant l'examen des cartes.</b><br>
+  L'extension utilise une simulation technique en coulisses. Si Anki est ferme de force pendant que la fenetre est ouverte, il suffit de lancer <i>Outils &gt; Verifier la base de donnees</i> pour vous assurer que tout est en ordre.</li>
+
+  <li><b>La regle d'or : Sauvegardez regulierement.</b><br>
+  Avant d'importer un deck de plusieurs milliers de cartes, prenez l'habitude d'exporter votre collection complete (<i>Fichier &gt; Exporter &gt; Paquet de collection Anki .colpkg avec medias</i>). En cas de fausse manipulation, vous pourrez revenir en arriere en 10 secondes.</li>
+</ul>
+
+<hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+<h2>A propos &amp; Credits</h2>
+<p style="font-size: 13px; color: #475569; line-height: 1.6;">
+  <b>Auteur &amp; Maintenance :</b> Developpe pour la communaute Anki et l'ecosysteme medical EDN par <b>Ficello</b>.<br>
+  <b>Conception &amp; Tests :</b> Architecture, suite de tests et revue developpees avec <b>Antigravity</b> (Google DeepMind).<br>
+  <b>Depot GitHub :</b> <a href="https://github.com/Ficello/Anki_Import_Diff_Review" style="color: #2563eb; text-decoration: none;">github.com/Ficello/Anki_Import_Diff_Review</a>
+</p>
+
+<hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+<h2>Compatibilite</h2>
+<ul>
+  <li>Anki 23.10+, Anki 24.x, Anki 25.x+</li>
+  <li>Windows, macOS et Linux</li>
+  <li>Compatible avec AnkiCollab (addon 1957538407) et les paquets medicaux EDN</li>
+</ul>

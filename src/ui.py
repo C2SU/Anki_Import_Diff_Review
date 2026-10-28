@@ -1232,6 +1232,26 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
         if vsb and scroll_pos > 0:
             vsb.setValue(scroll_pos)
 
+    def is_changed(self) -> bool:
+        """Retourne True si le champ a subi des modifications ou possede des hunks/editions."""
+        if self.diff and self.field_name in getattr(self.diff, 'custom_edit_fields', {}):
+            return True
+        if getattr(self, 'old_mod', '') != getattr(self, 'old_orig', ''):
+            return True
+        if getattr(self, 'prop_mod', '') != getattr(self, 'prop_orig', ''):
+            return True
+        if bool(getattr(self, 'hunks', [])):
+            return True
+        old_o = getattr(self, 'old_orig', '') or ''
+        prop_o = getattr(self, 'prop_orig', '') or ''
+        if old_o != prop_o:
+            try:
+                from .diff import normalize_html_tags
+                return normalize_html_tags(old_o) != normalize_html_tags(prop_o)
+            except Exception:
+                return True
+        return False
+
     def _refresh_display(self):
         c = self._palette_colors()
         is_unchanged = (self.old_orig == self.prop_orig)
@@ -1309,7 +1329,7 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
             html_content = _unfold_and_style_html(disp_val, self._model_css, c, placeholder)
             self._set_browser_html_preserve_scroll(html_content)
 
-        else:
+        elif self.active_target == "OLD":
             # L'éditeur contient l'ancien (old_mod)
             # Le diff affiche la proposition (prop_mod)
             disp_val = self.prop_mod
@@ -1346,6 +1366,26 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
                 self._btn_reset_diff.hide()
 
             placeholder = "[Champ vide dans la proposition]"
+            html_content = _unfold_and_style_html(disp_val, self._model_css, c, placeholder)
+            self._set_browser_html_preserve_scroll(html_content)
+
+        else:
+            # Sélection partielle de hunks (active_target == "PARTIAL")
+            self._badge.setText("Sélection partielle")
+            self._badge.setStyleSheet(
+                f"color:{c['accent']}; font-size:11px; font-weight:600; background:{c['surface_high']}; "
+                f"border:1px solid {c['accent']}; border-radius:10px; padding:2px 8px;"
+            )
+            self._btn_reject_all.setText("Garder l'ancien")
+            self._btn_reject_all.setEnabled(True)
+            self._btn_accept_all.setText("Accepter")
+            self._btn_accept_all.setEnabled(True)
+            self._btn_reset_editor.hide()
+            self._orig_lbl.setText("Version pré-maj")
+            self._btn_reset_diff.hide()
+
+            disp_val = self.old_mod
+            placeholder = "[Champ vide dans la version pré-maj]"
             html_content = _unfold_and_style_html(disp_val, self._model_css, c, placeholder)
             self._set_browser_html_preserve_scroll(html_content)
 
@@ -1426,12 +1466,19 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
             self.prop_mod = new_val
             if self.diff:
                 self.diff.prop_mod_fields[self.field_name] = new_val
-        else:
+        elif self.active_target == "OLD":
             if self.old_mod == new_val:
                 return
             self.old_mod = new_val
             if self.diff:
                 self.diff.old_mod_fields[self.field_name] = new_val
+        else:
+            if self.prop_mod == new_val:
+                return
+            self.prop_mod = new_val
+            if self.diff:
+                self.diff.prop_mod_fields[self.field_name] = new_val
+                self.diff.custom_edit_fields[self.field_name] = new_val
         self._refresh_display()
 
     def _on_hunk_state_changed(self):
@@ -1446,9 +1493,24 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
             self.active_target = "PROP"
         elif not any(h.accepted for h in self.hunks):
             self.active_target = "OLD"
+        else:
+            self.active_target = "PARTIAL"
+        merged_val = self.get_merged_value()
         if self.diff:
             self.diff.field_active_target[self.field_name] = self.active_target
-            self.diff.merged_fields[self.field_name] = self.get_merged_value()
+            self.diff.merged_fields[self.field_name] = merged_val
+            if self.active_target == "PARTIAL":
+                self.diff.custom_edit_fields[self.field_name] = merged_val
+            elif self.active_target == "PROP":
+                if self.prop_mod != self.prop_orig:
+                    self.diff.custom_edit_fields[self.field_name] = self.prop_mod
+                else:
+                    self.diff.custom_edit_fields.pop(self.field_name, None)
+            elif self.active_target == "OLD":
+                if self.old_mod != self.old_orig:
+                    self.diff.custom_edit_fields[self.field_name] = self.old_mod
+                else:
+                    self.diff.custom_edit_fields.pop(self.field_name, None)
         self._refresh_display()
         self.previewChanged.emit()
 
@@ -1457,6 +1519,9 @@ class FieldDiffPanel(QtWidgets.QFrame, PaletteMixin):
             return self.old_orig
         if self.diff and getattr(self.diff, "action", "") == "INSERT":
             return self.prop_mod
+        if self.hunks and any(h.accepted for h in self.hunks) and not all(h.accepted for h in self.hunks):
+            from .diff import apply_hunks
+            return apply_hunks(self.old_mod, self.prop_mod, self.hunks)
         if self.active_target == "OLD":
             return self.old_mod
         return self.prop_mod
@@ -1803,15 +1868,22 @@ class NoteDiffPanel(QtWidgets.QScrollArea, PaletteMixin):
                 self.note.tags = [t for t in new_val.strip().split(" ") if t]
                 if self._history_panel is not None:
                     self._history_panel._current_fields["__tags__"] = new_val
-                    self._history_panel._refresh_fields_preview()
+                    self._history_panel._render_comparison_view()
                 continue
             fp = self._field_panels.get(field_name)
             if fp is not None:
                 from .diff import compute_hunks
                 fp.new_val = new_val
+                fp.prop_mod = new_val
+                fp.active_target = "PROP"
+                if self.note is not None:
+                    self.note.prop_mod_fields[field_name] = new_val
+                    self.note.field_active_target[field_name] = "PROP"
+                    self.note.merged_fields[field_name] = new_val
                 fp.hunks = compute_hunks(fp.old_val, new_val)
                 for h in fp.hunks:
                     h.accepted = True
+                fp._refresh_display()
                 fp.previewChanged.emit()
 
     def _on_fields_protected(self, fields: Dict[str, str]) -> None:
@@ -1826,6 +1898,7 @@ class NoteDiffPanel(QtWidgets.QScrollArea, PaletteMixin):
                     hw.hunk.accepted = False
                     hw._protected = True
                     hw._refresh_state()
+                fp._refresh_display()
                 fp.previewChanged.emit()
 
     def _on_protection_tags_applied(self, tags: List[str]) -> None:
@@ -2314,7 +2387,7 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
         fl.setSpacing(4)
 
         self._filter_btns: Dict[str, QtWidgets.QPushButton] = {}
-        for key, label in [("all", "Tout"), ("pending", "En attente"), ("accepted", "Acceptés"), ("rejected", "Rejetés")]:
+        for key, label in [("all", "Tout"), ("pending", "En attente"), ("accepted", "Acceptés"), ("rejected", "Rejetés"), ("learned", "Apprises")]:
             btn = QtWidgets.QPushButton(label)
             btn.setCheckable(True)
             btn.setChecked(key == "all")
@@ -2412,7 +2485,11 @@ class VisualDiffDialog(QtWidgets.QDialog, PaletteMixin):
         self._list.clear()
         c = self._palette_colors()
         for i, note in enumerate(self.note_diffs):
-            if self._filter_mode != "all":
+            if self._filter_mode == "learned":
+                from .savepoint import is_note_learned
+                if not is_note_learned(note.note_id):
+                    continue
+            elif self._filter_mode != "all":
                 panel = self._note_panels.get(note.note_id)
                 if panel:
                     total_h = sum(len(fp.hunks) for fp in panel._field_panels.values())

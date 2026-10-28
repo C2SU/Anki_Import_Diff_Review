@@ -5,10 +5,11 @@ This add-on intercepts Anki's native CSV and APKG import processes when the "Vis
 
 ### Module Boundaries
 1. **`__init__.py`**: Add-on entry point, initializes hooks and UI modifications.
-2. **`src/hooks.py`**: Intercepts the CSV and APKG import panels to inject the checkbox and hijack the import execution.
-3. **`src/savepoint.py`**: SQLite savepoint wrapper. Wraps Anki collection DB transaction, executes the import inside the savepoint, diffs the modified notes, and executes rolls backs.
-4. **`src/diff.py`**: Utility to compute and render HTML diffs (additions in light green, deletions in light red).
-5. **`src/ui.py`**: PyQt modal dialog showing modified notes, field editor layouts, raw HTML toggle, and merge/commit controls.
+2. **`src/hooks.py`**: Intercepts the CSV and APKG import panels to inject the checkbox, hijack import execution, and setup background hooks.
+3. **`src/ankicollab_hook.py`**: Intercepts AnkiCollab deck updates (addon 1957538407), performs savepoint dry-runs, and routes modified cards to the Diff Browser.
+4. **`src/savepoint.py`**: SQLite savepoint wrapper. Wraps Anki collection DB transaction, executes the import inside the savepoint, diffs the modified notes, and executes rolls backs.
+5. **`src/diff.py`**: Utility to compute and render HTML diffs (additions in light green, deletions in light red).
+6. **`src/ui.py`**: PyQt modal dialog showing modified notes, field editor layouts, raw HTML toggle, and merge/commit controls.
 
 ### Data Flow
 1. User clicks "Import" → Dialog has "Visual Diff Import" checked.
@@ -37,6 +38,8 @@ This add-on intercepts Anki's native CSV and APKG import processes when the "Vis
 | M4 | Diff UI & Merge Controls | Build visual diff explorer dialog with PyQt, HTML toggles, and edit fields | M1, M2 | DONE |
 | M5 | Database Commit & Rollback | Connect UI choices to savepoint results, write updates to collection DB, cancel cleanup | M3, M4 | DONE |
 | M6 | E2E Verification & Hardening | Pass E2E tests, run Challenger/Auditor, and perform adversarial coverage hardening | M5 | DONE |
+| M7 | AnkiCollab Updates Interception | Hook AnkiCollab deck updates (1957538407), savepoint dry-run, browser diff review | M3, M4, M5 | DONE |
+| M8 | Lateral Menu Filters | Changed fields only (pre-checked) & Learned cards only (disabled by default) | M4, M7 | DONE |
 
 ## Interface Contracts
 ### `src.savepoint` Interface

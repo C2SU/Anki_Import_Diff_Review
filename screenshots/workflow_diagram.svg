@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 240" width="100%" height="100%">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .step-box { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; rx: 6px; }
+      .step-num { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; font-weight: 700; fill: #2563eb; letter-spacing: 0.5px; }
+      .step-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; font-weight: 700; fill: #0f172a; }
+      .step-desc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11.5px; fill: #475569; line-height: 1.4; }
+      .arrow { stroke: #94a3b8; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+      .arrow-head { fill: #94a3b8; }
+      .safe-tag { fill: #eff6ff; stroke: #bfdbfe; stroke-width: 1; rx: 3px; }
+      .safe-tag-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 10px; font-weight: 600; fill: #1d4ed8; }
+    </style>
+  </defs>
+
+  <rect width="100%" height="100%" class="bg" />
+
+  <!-- Step 1 -->
+  <g transform="translate(20, 20)">
+    <rect width="165" height="195" class="step-box" />
+    <text x="14" y="30" class="step-num">ETAPE 1</text>
+    <text x="14" y="52" class="step-title">Import ou Synchro</text>
+    <text x="14" y="80" class="step-desc">Vous lancez l'import</text>
+    <text x="14" y="98" class="step-desc">d'un fichier .apkg, .csv,</text>
+    <text x="14" y="116" class="step-desc">ou une mise a jour d'un</text>
+    <text x="14" y="134" class="step-desc">deck AnkiCollab.</text>
+    <rect x="14" y="160" width="135" height="22" class="safe-tag" />
+    <text x="22" y="175" class="safe-tag-text">Option cochee par defaut</text>
+  </g>
+
+  <!-- Arrow 1 -> 2 -->
+  <g transform="translate(195, 110)">
+    <line x1="0" y1="0" x2="16" y2="0" class="arrow" />
+    <polygon points="16,-4 24,0 16,4" class="arrow-head" />
+  </g>
+
+  <!-- Step 2 -->
+  <g transform="translate(225, 20)">
+    <rect width="165" height="195" class="step-box" />
+    <text x="14" y="30" class="step-num">ETAPE 2</text>
+    <text x="14" y="52" class="step-title">Sas de Securite</text>
+    <text x="14" y="80" class="step-desc">L'extension simule</text>
+    <text x="14" y="98" class="step-desc">l'operation sans toucher</text>
+    <text x="14" y="116" class="step-desc">a votre collection.</text>
+    <text x="14" y="134" class="step-desc">Les deltas sont calcules.</text>
+    <rect x="14" y="160" width="135" height="22" class="safe-tag" />
+    <text x="22" y="175" class="safe-tag-text">Zero risque d'ecrasement</text>
+  </g>
+
+  <!-- Arrow 2 -> 3 -->
+  <g transform="translate(400, 110)">
+    <line x1="0" y1="0" x2="16" y2="0" class="arrow" />
+    <polygon points="16,-4 24,0 16,4" class="arrow-head" />
+  </g>
+
+  <!-- Step 3 -->
+  <g transform="translate(430, 20)">
+    <rect width="165" height="195" class="step-box" />
+    <text x="14" y="30" class="step-num">ETAPE 3</text>
+    <text x="14" y="52" class="step-title">Revue Visuelle</text>
+    <text x="14" y="80" class="step-desc">Fenetre comparative :</text>
+    <text x="14" y="98" class="step-desc">• Rouge = supprime</text>
+    <text x="14" y="116" class="step-desc">• Vert = ajoute</text>
+    <text x="14" y="134" class="step-desc">Vous choisissez carte</text>
+    <text x="14" y="152" class="step-desc">par carte ou champ</text>
+    <text x="14" y="170" class="step-desc">par champ ce qui reste.</text>
+  </g>
+
+  <!-- Arrow 3 -> 4 -->
+  <g transform="translate(605, 110)">
+    <line x1="0" y1="0" x2="16" y2="0" class="arrow" />
+    <polygon points="16,-4 24,0 16,4" class="arrow-head" />
+  </g>
+
+  <!-- Step 4 -->
+  <g transform="translate(635, 20)">
+    <rect width="145" height="195" class="step-box" />
+    <text x="14" y="30" class="step-num">ETAPE 4</text>
+    <text x="14" y="52" class="step-title">Decision Finale</text>
+    <text x="14" y="80" class="step-desc">• Confirmer : seuls</text>
+    <text x="14" y="98" class="step-desc">les changements</text>
+    <text x="14" y="116" class="step-desc">acceptes sont ecrits.</text>
+    <text x="14" y="140" class="step-desc">• Annuler : tout est</text>
+    <text x="14" y="158" class="step-desc">abandonne, collection</text>
+    <text x="14" y="176" class="step-desc">100% preservee.</text>
+  </g>
+</svg>

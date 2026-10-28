@@ -223,13 +223,6 @@ class TempLinkInterceptor:
         successful_migrations: Dict[int, int] = {}
         now = int(time.time())
 
-        # Save initial state of PRAGMA foreign_keys
-        orig_fk = None
-        try:
-            orig_fk = col.db.scalar("PRAGMA foreign_keys")
-        except Exception:
-            pass
-
         try:
             col.db.execute("PRAGMA foreign_keys = OFF")
             for staged_nid, real_nid in mapping.items():
@@ -264,6 +257,7 @@ class TempLinkInterceptor:
 
         finally:
             try:
+                # Toujours rétablir PRAGMA foreign_keys = ON pour garantir l'intégrité de la base Anki
                 col.db.execute("PRAGMA foreign_keys = ON")
             except Exception:
                 pass
